@@ -16,6 +16,14 @@ Improves NVDA's touch explore-by-touch feedback:
   same item (NVDA sometimes speaks an item once via its object description
   and once via its text/cell content, which can otherwise sound like an
   echo).
+- Moves real focus/selection to whatever item your finger lands on
+  (VoiceOver-style), so "selected"/"not selected" speech reflects reality
+  instead of firing on every item regardless of context.
+- Adds a split-tap activation gesture: hold one finger on a touch-explored
+  item, then tap anywhere else on the screen with a second finger to
+  activate that item (its default action - e.g. open it), equivalent to
+  double-tapping the item itself without needing to lift and re-tap the
+  same exact spot.
 
 ## Why this happens in stock NVDA
 
