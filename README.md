@@ -26,6 +26,17 @@ Improves NVDA's touch explore-by-touch feedback:
   same exact spot.
 - Fixes multi-finger taps sometimes being detected with fewer fingers than
   actually used (e.g. a 3-finger tap registering as a 1- or 2-finger tap).
+- Adds a trackpad-as-touchscreen mode (**NVDA+Ctrl+Shift+T** to toggle): on a
+  laptop with no touchscreen, reads your trackpad's own multi-touch surface
+  directly and maps it onto the whole screen, so every touch gesture above -
+  plus NVDA's own built-in touch gestures (explore, tap, flick, multi-finger
+  taps, mode-cycling, etc) - work from the trackpad exactly as they would on
+  real touchscreen hardware. While this mode is on, the add-on also turns off
+  the OS's own trackpad gestures (tap-to-click, two-finger tap, pinch/pan,
+  the corner right-click zone) that would otherwise fire at the same time
+  from the same fingers, and restores your original trackpad settings when
+  you turn the mode back off. See "Trackpad-as-touchscreen mode" below for
+  requirements and limitations.
 
 ## Why this happens in stock NVDA
 
@@ -66,6 +77,68 @@ Produces `touchExplore.nvda-addon` in the project root.
 Double-click `touchExplore.nvda-addon` with NVDA running, or open it via
 NVDA's Add-on Store > "Install from external source", and restart NVDA when
 prompted.
+
+## Trackpad-as-touchscreen mode
+
+Press **NVDA+Ctrl+Shift+T** to turn this on or off; NVDA announces the new
+state. While on, dragging a finger on your trackpad explores the screen the
+same way dragging a finger on a real touchscreen would (proportionally - the
+top-left of your trackpad maps to the top-left of your screen, and so on),
+and all touch gestures (tap, flick, hold, multi-finger taps, this add-on's
+split-tap activation, etc) work from it.
+
+Requirements:
+
+- A Windows Precision Touchpad (the standard type on virtually all modern
+  Windows laptops; older "legacy" trackpads that only report themselves to
+  Windows as a plain mouse are not supported, since they don't expose real
+  multi-touch contact data to any application).
+- Works on any Windows version for the touch input itself. The best-effort
+  minimization of the OS's own trackpad gestures while this mode is on
+  additionally requires Windows 11 version 24H2 or later; on earlier Windows
+  versions that part is silently skipped and trackpad-as-touchscreen mode
+  still works, just with more potential interference from the OS's own
+  gesture recognition running on the same physical trackpad at the same
+  time.
+
+Limitations:
+
+- While trackpad-as-touchscreen mode is on, the ordinary mouse cursor is
+  frozen in place - it won't move or click, from the trackpad or from any
+  other mouse connected to your PC at the time, since Windows only lets an
+  application suppress normal mouse behavior for a whole class of device,
+  not one specific physical mouse. Your mouse (all mice) work normally
+  again the instant you turn trackpad mode back off. This is deliberate: it
+  stops a swipe/tap gesture from also moving the real cursor or triggering
+  a real click somewhere on screen.
+- Windows does not provide any documented way for an application to become
+  the *exclusive* consumer of a trackpad's input for its OS-level gestures
+  specifically (separate from the mouse-cursor freeze above). 3/4-finger
+  gestures in particular (3-finger tap opening the Start menu, 3/4-finger
+  swipes switching virtual desktops or opening Task View) will still fire
+  from the OS while trackpad-as-touchscreen mode is on - this was
+  specifically investigated and confirmed not fixable live: Windows' only
+  setting for this ("Three- and four-finger touch gestures" in
+  Settings > Bluetooth & devices > Touchpad) does not take effect without a
+  sign-out or restart, even when toggled through the same
+  `SystemParametersInfo`-style mechanism this add-on already uses
+  successfully for other touchpad settings, so this add-on does not attempt
+  to toggle it automatically. If this bothers you, turn it off yourself in
+  Windows Settings (accepting the restart) - it isn't undone when you turn
+  trackpad-as-touchscreen mode off, since this add-on never touches it.
+- This add-on also temporarily turns off NVDA's "report object under mouse
+  pointer" setting (NVDA Settings > Mouse) while trackpad-as-touchscreen
+  mode is on, as a second layer of protection alongside the cursor freeze
+  above. Your normal setting is restored exactly as it was when you turn
+  trackpad mode back off.
+- If your laptop has a real touchscreen *in addition to* a trackpad,
+  turning on trackpad-as-touchscreen mode temporarily takes over as the
+  active touch input source - the real touchscreen won't respond to touch
+  while trackpad mode is on. Turning trackpad mode back off immediately
+  restores the real touchscreen, no restart needed.
+- Multi-finger contact tracking depends on your trackpad's own hardware/
+  driver correctly reporting simultaneous contacts and an accurate contact
+  count; this varies somewhat by manufacturer.
 
 ## Notes / limitations
 

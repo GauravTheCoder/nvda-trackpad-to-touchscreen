@@ -13,6 +13,12 @@
 #   finger, and that item is activated (its default action performed) -
 #   equivalent to double-tapping the item itself, without needing to lift
 #   and re-tap the same exact spot.
+# - Adds a trackpad-as-touchscreen mode (NVDA+Ctrl+Shift+T to toggle): reads
+#   the trackpad's own raw multi-touch HID contacts and feeds them into
+#   NVDA's real touch pipeline, so every touch gesture above - and NVDA's
+#   own stock touch gestures - work from a trackpad on a machine with no
+#   touchscreen. See trackpadTouch.py for the implementation and
+#   CLAUDE.md for the hardware-verified details behind it.
 #
 # Touch explore-by-touch reporting lives in
 # screenExplorer.ScreenExplorer.moveTo(), called directly by touchHandler
@@ -22,6 +28,7 @@
 # patching one instance, we patch the moveTo method on the class itself.
 
 import api
+import config
 import controlTypes
 import globalPluginHandler
 import locationHelper
@@ -31,10 +38,14 @@ import textInfos
 import tones
 import touchHandler
 import touchTracker
+import ui
 from comtypes import COMError
 from logHandler import log
 from scriptHandler import script
 from utils.security import objectBelowLockScreenAndWindowsIsLocked
+
+from . import touchpadOsSettings
+from .trackpadTouch import TrackpadTouchScreen
 
 # Roles that are "generic containers": their own announcement (name, role,
 # row/column counts) is a waypoint, not content. This is true whether the
@@ -174,6 +185,34 @@ _driftPatched = False
 # --- end multi-finger tap fix -------------------------------------------
 
 
+# --- Tap/flick classification timeout fix -------------------------------
+# touchTracker.SingleTouchTracker.update() locks a touch's action to HOVER
+# the instant touchTracker.multitouchTimeout (0.25s default) elapses since
+# the touch started, on ANY update() call (not just on lift) - regardless of
+# what the finger does afterward. Diagnosed via log.debug instrumentation on
+# trackpadTouch.TrackpadTouchScreen while investigating multi-finger taps
+# and flicks not registering in trackpad-as-touchscreen mode: a deliberate,
+# genuine 2-finger tap attempt was observed taking longer than 250ms
+# door-to-door (coordinating two fingers to touch and lift together takes
+# real, measurable time), so by the time the fingers lifted, both had
+# already been irreversibly locked to HOVER and could never become
+# action_tap/action_flick* at all - not a merge-logic problem, and not
+# fixable by any amount of prompt update() calling once the 250ms window has
+# actually elapsed relative to real time. Raising the timeout gives real
+# human multi-finger gestures (and flicks in general) more realistic budget
+# to complete before being written off as a hover, at the cost of also
+# giving a genuinely slow hover/drag slightly longer before NVDA starts
+# treating its own continued movement as touch-exploring rather than a
+# potential tap-in-progress - same class of "the machine-tight default
+# doesn't match real human timing" fix as the drift patch above, and
+# extended module-globally the same way, applying to real touchscreen
+# gestures too, not just trackpad mode (accepted; see CLAUDE.md).
+_originalMultitouchTimeout = touchTracker.multitouchTimeout
+_PATCHED_MULTITOUCH_TIMEOUT = 0.4
+_timeoutPatched = False
+# --- end tap/flick classification timeout fix ---------------------------
+
+
 _originalMoveTo = screenExplorer.ScreenExplorer.moveTo
 _patched = False
 
@@ -307,7 +346,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	def __init__(self):
 		super().__init__()
-		global _patched, _driftPatched
+		global _patched, _driftPatched, _timeoutPatched
 		if not _patched:
 			screenExplorer.ScreenExplorer.moveTo = _patchedMoveTo
 			_patched = True
@@ -316,9 +355,17 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			touchTracker.maxAccidentalDrift = _PATCHED_MAX_ACCIDENTAL_DRIFT
 			_driftPatched = True
 			log.debug("touchExplore: raised touchTracker.maxAccidentalDrift")
+		if not _timeoutPatched:
+			touchTracker.multitouchTimeout = _PATCHED_MULTITOUCH_TIMEOUT
+			_timeoutPatched = True
+			log.debug("touchExplore: raised touchTracker.multitouchTimeout")
+		self._trackpadTouchScreen = None
+		self._savedMouseTrackingEnabled = None
 
 	def terminate(self):
-		global _patched, _driftPatched
+		global _patched, _driftPatched, _timeoutPatched
+		if self._trackpadTouchScreen is not None:
+			self._disableTrackpadTouchScreen()
 		if _patched:
 			screenExplorer.ScreenExplorer.moveTo = _originalMoveTo
 			_patched = False
@@ -327,7 +374,76 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			touchTracker.maxAccidentalDrift = _originalMaxAccidentalDrift
 			_driftPatched = False
 			log.debug("touchExplore: restored original touchTracker.maxAccidentalDrift")
+		if _timeoutPatched:
+			touchTracker.multitouchTimeout = _originalMultitouchTimeout
+			_timeoutPatched = False
+			log.debug("touchExplore: restored original touchTracker.multitouchTimeout")
 		super().terminate()
+
+	def _enableTrackpadTouchScreen(self):
+		mode = touchHandler.handler._curTouchMode if touchHandler.handler else "object"
+		self._trackpadTouchScreen = TrackpadTouchScreen(mode=mode)
+		self._trackpadTouchScreen.start()
+		touchpadOsSettings.minimizeOsGestures()
+		# The trackpad is still, physically, an ordinary mouse-class HID
+		# device - it keeps generating real WM_MOUSEMOVE events in parallel
+		# with the raw digitizer contacts this add-on reads directly, moving
+		# the real OS mouse cursor along with the tracked finger. If NVDA's
+		# own "report object under mouse pointer" setting is on
+		# (config.conf["mouse"]["enableMouseTracking"]), NVDA's
+		# mouseHandler.executeMouseMoveEvent() independently announces
+		# whatever the real cursor passes over via its own event_mouseMove
+		# pipeline - completely separate from, and not covered by, this
+		# add-on's screenExplorer.moveTo patch, since that patch only
+		# affects touch-explore's own announcement path. Confirmed directly:
+		# "Desktop" (the desktop icon view's own name) was being spoken
+		# between icons even though _patchedMoveTo's own debug logging
+		# showed containerHit=True (correctly silent) for every one of those
+		# hits - the speech was coming from mouse tracking, not touch
+		# explore. Temporarily disabling mouse tracking while trackpad mode
+		# is on removes the interference; the user's real preference is
+		# restored exactly when trackpad mode is turned back off.
+		self._savedMouseTrackingEnabled = config.conf["mouse"]["enableMouseTracking"]
+		config.conf["mouse"]["enableMouseTracking"] = False
+		log.debug("touchExplore: trackpad-as-touchscreen mode enabled")
+
+	def _disableTrackpadTouchScreen(self):
+		touchpadOsSettings.restoreOsGestures()
+		self._trackpadTouchScreen.stop()
+		self._trackpadTouchScreen = None
+		if self._savedMouseTrackingEnabled is not None:
+			config.conf["mouse"]["enableMouseTracking"] = self._savedMouseTrackingEnabled
+			self._savedMouseTrackingEnabled = None
+		log.debug("touchExplore: trackpad-as-touchscreen mode disabled")
+
+	@script(
+		# Translators: Input help mode message for the gesture that toggles
+		# trackpad-as-touchscreen mode (using the laptop trackpad's raw
+		# multi-touch contacts as if it were a touchscreen, mapped onto the
+		# whole screen).
+		description=_(
+			"Toggles trackpad-as-touchscreen mode, letting you use touch "
+			"gestures on a laptop trackpad as if it were a touchscreen",
+		),
+		gestures=("kb:NVDA+control+shift+t",),
+	)
+	def script_toggleTrackpadTouchScreen(self, gesture):
+		if self._trackpadTouchScreen is None:
+			try:
+				self._enableTrackpadTouchScreen()
+			except Exception:
+				log.error("touchExplore: failed to enable trackpad-as-touchscreen mode", exc_info=True)
+				self._trackpadTouchScreen = None
+				# Translators: reported when trackpad-as-touchscreen mode
+				# fails to start (e.g. no supported touchpad found).
+				ui.message(_("Could not enable trackpad touchscreen mode"))
+				return
+			# Translators: reported when trackpad-as-touchscreen mode is turned on.
+			ui.message(_("Trackpad touchscreen mode on"))
+		else:
+			self._disableTrackpadTouchScreen()
+			# Translators: reported when trackpad-as-touchscreen mode is turned off.
+			ui.message(_("Trackpad touchscreen mode off"))
 
 	@script(
 		# Translators: Input help mode message for the split-tap activation
