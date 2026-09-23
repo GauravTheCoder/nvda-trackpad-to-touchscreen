@@ -24,6 +24,8 @@ Improves NVDA's touch explore-by-touch feedback:
   activate that item (its default action - e.g. open it), equivalent to
   double-tapping the item itself without needing to lift and re-tap the
   same exact spot.
+- Fixes multi-finger taps sometimes being detected with fewer fingers than
+  actually used (e.g. a 3-finger tap registering as a 1- or 2-finger tap).
 
 ## Why this happens in stock NVDA
 
@@ -76,3 +78,8 @@ prompted.
 - Tested against the NVDA `screenExplorer.py` logic as of the 2026.1 source.
   If a future NVDA version changes `moveTo`'s internals substantially, the
   patched copy in this add-on may need to be resynced with core.
+- The multi-finger tap fix raises `touchTracker.maxAccidentalDrift` (how far
+  a finger may move during a tap before NVDA stops considering it a tap) from
+  its default of 10px to 25px. If taps still misdetect on your hardware, or
+  if genuine small drags start being misread as taps, adjust the value in
+  `touchExplore/globalPlugins/touchExplore/__init__.py`.

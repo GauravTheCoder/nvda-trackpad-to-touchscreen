@@ -30,6 +30,7 @@ import speech
 import textInfos
 import tones
 import touchHandler
+import touchTracker
 from comtypes import COMError
 from logHandler import log
 from scriptHandler import script
@@ -147,6 +148,30 @@ def _activateObject(obj, gesture) -> None:
 			return
 		except NotImplementedError:
 			obj = obj.parent
+
+
+# --- Multi-finger tap misdetection fix --------------------------------
+# NVDA sometimes recognizes a 3-finger (or 2-finger) tap as having fewer
+# fingers than were actually used. Diagnosed via log.debug instrumentation
+# on touchTracker.TrackerManager: SingleTouchTracker.update() only
+# classifies a completed touch as action_tap if it stayed within
+# touchTracker.maxAccidentalDrift (10px) of its start point for its entire
+# duration; if it drifts further it's left as action_unknown and never
+# reaches processAndQueueMultiTouchTracker's merge logic at all (only
+# non-unknown actions get queued/merged there). With multiple simultaneous
+# fingers, it's normal for at least one to drift more than a single
+# practiced finger tap would - observed drift on failed 3-finger taps was
+# up to ~19px, comfortably exceeding the 10px default and causing 1-2 of
+# the 3 fingers to silently drop out, so NVDA reports a 1 or 2 finger tap
+# instead. Raising the threshold fixes this at the source (touch tracking
+# is otherwise unmodified) without touching the merge logic itself, which
+# behaved correctly (pure time-interval overlap; not the actual culprit -
+# multi-finger flicks, which don't have a drift ceiling, always merged
+# correctly in the same test session).
+_originalMaxAccidentalDrift = touchTracker.maxAccidentalDrift
+_PATCHED_MAX_ACCIDENTAL_DRIFT = 25
+_driftPatched = False
+# --- end multi-finger tap fix -------------------------------------------
 
 
 _originalMoveTo = screenExplorer.ScreenExplorer.moveTo
@@ -282,18 +307,26 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	def __init__(self):
 		super().__init__()
-		global _patched
+		global _patched, _driftPatched
 		if not _patched:
 			screenExplorer.ScreenExplorer.moveTo = _patchedMoveTo
 			_patched = True
 			log.debug("touchExplore: patched ScreenExplorer.moveTo")
+		if not _driftPatched:
+			touchTracker.maxAccidentalDrift = _PATCHED_MAX_ACCIDENTAL_DRIFT
+			_driftPatched = True
+			log.debug("touchExplore: raised touchTracker.maxAccidentalDrift")
 
 	def terminate(self):
-		global _patched
+		global _patched, _driftPatched
 		if _patched:
 			screenExplorer.ScreenExplorer.moveTo = _originalMoveTo
 			_patched = False
 			log.debug("touchExplore: restored original ScreenExplorer.moveTo")
+		if _driftPatched:
+			touchTracker.maxAccidentalDrift = _originalMaxAccidentalDrift
+			_driftPatched = False
+			log.debug("touchExplore: restored original touchTracker.maxAccidentalDrift")
 		super().terminate()
 
 	@script(
