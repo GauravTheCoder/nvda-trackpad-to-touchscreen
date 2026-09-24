@@ -15,7 +15,10 @@ def main():
 	if os.path.exists(OUT_FILE):
 		os.remove(OUT_FILE)
 	with zipfile.ZipFile(OUT_FILE, "w", zipfile.ZIP_DEFLATED) as zf:
-		for dirpath, _dirnames, filenames in os.walk(SRC_DIR):
+		for dirpath, dirnames, filenames in os.walk(SRC_DIR):
+			# Local bytecode caches (e.g. from running tests against the
+			# source) can hold stale modules that no longer exist in source.
+			dirnames[:] = [d for d in dirnames if d != "__pycache__"]
 			for filename in filenames:
 				fullPath = os.path.join(dirpath, filename)
 				relPath = os.path.relpath(fullPath, SRC_DIR).replace(os.sep, "/")

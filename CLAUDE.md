@@ -256,6 +256,12 @@ or a different Windows version.
     (capability-query-only, no read/write) — `GENERIC_READ|GENERIC_WRITE`
     fails with `ERROR_SHARING_VIOLATION` (error 32) because the OS's own
     touchpad driver already holds the device open for read/write.
+- **CORRECTION (see "Hardware-universality pass" below): this bullet is
+  wrong.** Tip Switch (`0x42`) and Confidence (`0x47`) are 1-bit *button*
+  usages, so they never appear in `HidP_GetValueCaps` output - the dump this
+  conclusion was drawn from. A `HidP_GetButtonCaps` probe shows this pad
+  declares Tip, Confidence and In Range (`0x32`) on every contact link
+  collection. Original (incorrect) text kept below for history:
 - **This hardware's HID report does not include a Tip Switch usage
   (`0x0D`/`0x42`) at all**, despite Tip Switch being documented as
   *mandatory* for a spec-compliant Windows Precision Touchpad (see
@@ -1045,6 +1051,11 @@ be trusted to reflect the state at the moment of the actual bug.
 
 ### Feature: explore/click sound effects, replacing the tone beep
 
+**Superseded by "Earcon sound packs, extra gestures, diagnostics" below.**
+The files described here now live, shortened, in `sounds/classic/`, and
+`nvwave.playWaveFile` is no longer used. The notes are kept for their
+format/conversion findings.
+
 User-supplied `explore.mp3`/`click.mp3` (in the repo's own `resources/`
 folder, unrelated to NVDA - a separate UI sound-effects asset library
 already present in the working directory before this add-on touched it)
@@ -1101,6 +1112,164 @@ script changes needed).
   confirm audibly (via `Media.SoundPlayer` in a probe script) rather than
   just trusting that a successful `ffmpeg` exit code meant a correct,
   audible result.
+
+### Hardware-universality pass (trackpad mode on non-development hardware)
+
+Goal: make trackpad mode correct on Precision Touchpads other than the
+development one, without changing behavior on it. What changed and why:
+
+- **Tip/Confidence read as buttons** (`HidP_GetButtonCaps`/`HidP_GetUsages`),
+  and honored only for slots that declare them: Tip clear = the spec's
+  explicit lift report (lift at last tip-down position); Confidence clear =
+  palm, ignored until that contact ID stops being reported (the spec says
+  confidence stays cleared for the rest of the contact's life). Without the
+  usages (or if reading them fails) liveness is Contact Count alone, as
+  before. **Not yet confirmed from a live capture on this pad** - a 90s
+  capture attempt recorded 0 reports (almost certainly no touch during the
+  window, per the handoff warning above). The decoder *is* verified against
+  this pad's real preparsed data, using reports built with
+  `HidP_SetUsageValue`/`HidP_SetUsages` - a useful technique for testing HID
+  decode without anyone touching the hardware.
+- **Hybrid reporting mode** (`_FrameAssembler`): a frame split across
+  reports (first has the real Contact Count, the rest have 0 and the same
+  Scan Time) is reassembled. Previously the Contact Count 0 follow-up read
+  as "every finger lifted". The dev pad has 5 slots per report (parallel
+  mode), so it never takes this path.
+- **Unreadable Contact Count = ignore the report**, not "0 contacts" (a
+  report with a different Report ID used to lift every finger).
+- **Contacts keyed by (hDevice, contactId)**, mapped to fresh integer
+  tracker IDs - two touchpads no longer collide.
+- **Lift-inference timeout** = max(80ms, 8 × the device's smoothed
+  real-report interval; gaps over 250ms excluded from the average). At this
+  pad's report rate the 80ms floor wins, so behavior here is unchanged.
+- **Maps onto the foreground window's monitor**, fixed per gesture. Falls
+  back to primary when `config.conf["touch"]["edgeGestures"]` is on, because
+  `touchHandler._getEdge` tests against primary-screen size only.
+- **`RIDEV_DEVNOTIFY` + `WM_INPUT_DEVICE_CHANGE`**: on removal, lift that
+  device's contacts and drop cached state. `hDevice == 0` is attributed to
+  the sole touchpad if there's exactly one. `NoTouchpadFoundError` gives a
+  specific spoken message.
+- **`pump()` borrows `TouchHandler._processGestures`** (plus
+  `_tryBuildSequentialGesture`) when present, so trackpad input gets NVDA's
+  sequential flicks. On any exception it falls back to the legacy loop for the
+  rest of the session. **The installed NVDA 2026.2 does NOT have
+  `_processGestures`, sequential flicks or edge gestures** - checked by
+  grepping names out of `touchHandler.pyc` in `C:\Program Files\NVDA\library.zip`
+  (it does have `TouchMode` and pinch). Those are newer than 2026.2 on
+  `master`, so here the legacy loop runs. The "Source of truth" section's
+  mention of `_processGestures` on the installed version was a `master`
+  fact, not an installed-version fact. Grepping `.pyc` names in
+  `library.zip` is a quick, reliable way to check what the installed NVDA
+  actually has.
+- `build.py` now skips `__pycache__` (a stale `ghostWindow.pyc` from the
+  reverted module had been shipping inside the package).
+
+Tests: standalone, NVDA modules stubbed, not tracked in the repo (same as
+the earlier lift-inference tests). **User confirmed live afterwards: works
+well on the development hardware.**
+
+### Touch thresholds in millimetres + calibration (`touchSettings.py`, `calibration.py`, `settingsUI.py`)
+
+**What the installed NVDA 2026.2 actually does** (read from the
+`release-2026.2` tag, which matches the installed version per
+`_buildVersion.pyc` - fetch that tag, not `master`, while 2026.2 is what's
+installed). This corrects claims elsewhere in this file that came from
+`master`:
+- `SingleTouchTracker.update()` is purely distance-based: tap if both
+  per-axis max deltas `< maxAccidentalDrift`, flick if the dominant axis
+  `>= minFlickDistance`, both only `if deltaTime < multitouchTimeout`,
+  otherwise `action_hover`. **No `minFlickVelocity` / velocity window in
+  2026.2**, and it uses the `action_*` string constants, not a
+  `TouchAction` enum (`touchHandler.TouchMode` does exist).
+- `multitouchTimeout` has three jobs: the maximum tap/flick duration; the
+  double-tap window (`pluralTimeout = startTime + multitouchTimeout`, so the
+  second tap must *start* within it of the first tap's *start*); and the
+  wait before a single tap is emitted.
+- `minPinchDistance` exists (pixels).
+
+**Design**:
+- The settings are per input source (touchscreen / trackpad), stored flat
+  in `config.conf["touchExplore"]` (so they're profile-aware), and converted
+  to px into the same `touchTracker` globals. The touchscreen uses
+  `screenPxPerMm()`: `DESKTOPHORZRES/HORZSIZE` averaged with the vertical
+  equivalent. Not `HORZRES`: that one is scaled for a non-DPI-aware thread
+  (it read 1536 instead of 2304 at 150%). The trackpad uses mapped-monitor px
+  / pad mm, from the HID Physical/Unit/UnitExp of X/Y (this pad: 120 × 80 mm),
+  recomputed in `_applyThresholds` whenever a gesture's map rect is chosen.
+- The defaults reproduce the old fixed 25px / 50px / 0.4s exactly on the
+  development hardware (touchscreen 7.92 px/mm → 3.2/6.3 mm; trackpad
+  19.2 px/mm → 1.3/2.6 mm). Other hardware gets the same physical feel
+  instead of the same pixel count.
+- Calibration records by wrapping the active source's
+  `trackerManager.update` on the *instance* (`del` restores it), and blocks
+  touch gestures during capture via `inputCore.decide_executeGesture`. Both
+  are undone in a `finally` after `ShowModal()`, because wx's C++
+  Escape/Cancel path never calls a Python `EndModal` override. Leaving the
+  decider registered would kill all touch input until NVDA restarts.
+- For speech, set focus first, then `wx.CallLater(300, ui.message, ...)`:
+  NVDA's own focus announcement cancels speech that's already in progress.
+- `validate()` compares with a 1e-6 tolerance, because 0.8 × 1.5 is
+  1.2000000000000002; a test sweeping every drift value caught this.
+- **The GUI (panel + dialog) can't run outside NVDA** and hasn't been
+  exercised live yet. The logic under it is covered by the standalone tests.
+
+### Earcon sound packs, extra gestures, diagnostics (`audioCues.py`, `monitors.py`, `diagnostics.py`)
+
+- **Sounds**: `sounds/earcons/` holds Kenney "Interface Sounds" (CC0;
+  downloaded from kenney.nl, licence copied alongside), and `sounds/classic/`
+  the original explore/click. Both are built by
+  `resources/sounds/build_sounds.py` (checked to rebuild byte-identically).
+  Cues were chosen by *measured* duration/brightness, since no one could
+  listen during the build: frequent cues are under about 100ms, and all
+  are under 300ms. `resources/sounds/earcon-audition.wav` (gitignored)
+  speaks each cue's name, via Windows SAPI TTS, before playing it, so the
+  user can judge the set by ear. The old explore sound's *audible* part
+  was only about 65ms; most of its ~1s length was a quiet tail.
+- **Why not `nvwave.playWaveFile`**: panning. `WavePlayer.stop()`/`open()`
+  call `_setVolumeFromConfig()`, which resets every channel's volume, so
+  `setVolume(left=, right=)` can't hold a pan. Instead the pan is baked into
+  stereo sample data (linear gains; centre = both channels at full level),
+  cached per quantised pan step, and fed to one persistent
+  `WavePlayer(purpose=AudioPurpose.SOUNDS)`. That purpose is what applies
+  NVDA's sound volume. `feed()` doesn't block for clips this short, so no
+  thread is needed. `nvwave.decide_playWaveFile` is still consulted.
+- **Height as pitch** (user request, after trying the panning): y within
+  the touched monitor maps to ±`PITCH_RANGE_SEMITONES` (6), quantised to
+  whole semitones, with the top edge highest. It's done by linear-interpolation
+  resampling of the samples (`_pitched`), not by changing the player's rate,
+  so one `WavePlayer` serves every pitch. Duration scales with pitch, which
+  is fine for these short cues. Verified musically with an FFT on a 440Hz
+  sine: +12 → 880, −12 → 220, +6 → 622. The first render costs 1.4ms for the
+  item cue and 8ms for the longest (activate); cached renders are microseconds.
+  The render cache is keyed (path, panStep, semitones) and capped at 256
+  entries, dropping the oldest first. The audition file demos height, pan and
+  both, rendered by the add-on's own `_renderedData` so it's exactly what
+  NVDA plays.
+- **`monitors.py` exists because ctypes `argtypes` are process-global.**
+  Two modules each declaring `GetMonitorInfoW` with their *own*
+  `MONITORINFO` class would break whichever loaded first
+  (`ArgumentError`). Any Win32 function taking a Structure should be
+  declared in exactly one module.
+- **Gestures** use IDs that 2026.2's `globalCommands` leaves unbound
+  (checked against `release-2026.2`): `ts:2finger_tap`,
+  `ts:3finger_double_tap`, `ts(object):3finger_flickup/down` (text mode's
+  `3finger_flickDown` is stock say-all), `ts:2finger_triple_tap`
+  (`counterNames` = single/double/triple/quadruple), and
+  `ts:2finger_pinchin/out`. Pinch trackers are always `numFingers=2`, hence
+  the `2finger_` prefix. Rate changes are stored exactly as
+  `synthSettingsRing` does it (`setattr(synth, ...)` plus
+  `config.conf["speech"][synth.name][...]`). Keys are sent with
+  `KeyboardInputGesture.fromName("pageDown"/"pageUp"/"mediaPlayPause")`,
+  whose names were checked in `vkCodes.py`.
+- **Diagnostics**: `diagnostics.collect()` reports versions, touch hardware,
+  px/mm, the `touchTracker` values in effect, every setting, and each
+  touchpad's VID/PID/slots/Tip/Confidence/size/report interval. It was run
+  against the real hardware in the tests. Config sections are read key by
+  key: an `AggregatedSection` isn't guaranteed to support `.get()`/`.items()`.
+- **Not exercised live yet**: the panel's sound controls, the preview, and
+  the new gestures inside NVDA. Covered by the standalone tests: role→cue
+  mapping, pan data, fallback pack, decider, failure safety, and every
+  bundled file loading and being short.
 
 ## Debugging workflow that actually worked
 

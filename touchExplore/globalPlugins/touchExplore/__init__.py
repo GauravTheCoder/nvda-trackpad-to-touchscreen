@@ -1,7 +1,8 @@
 # Touch Explore Sounds
 # A global plugin for NVDA that improves touch-explore feedback:
-# - Plays a short tone when the finger lands on a real, actionable item
-#   (icon, list item, button, link, etc), and moves real focus/selection to
+# - Plays a short earcon when the finger lands on a real, actionable item
+#   (icon, list item, button, link, etc - a different one per kind of
+#   control, panned by position; see audioCues.py), and moves real focus/selection to
 #   it (VoiceOver-style), letting NVDA's own focus-speech pipeline announce
 #   it correctly (role suppression, selection state, etc) instead of us
 #   re-implementing that logic and risking double speech.
@@ -27,50 +28,31 @@
 # support is toggled or a config profile switch occurs), so rather than
 # patching one instance, we patch the moveTo method on the class itself.
 
-import os
-
 import api
 import config
 import controlTypes
 import globalPluginHandler
+import gui
 import locationHelper
-import nvwave
 import screenExplorer
 import speech
 import textInfos
 import touchHandler
-import touchTracker
 import ui
+import wx
 from comtypes import COMError
 from logHandler import log
 from NVDAObjects import NVDAObject
 from scriptHandler import script
 from utils.security import objectBelowLockScreenAndWindowsIsLocked
 
+from . import audioCues
+from . import diagnostics
+from . import settingsUI
 from . import touchpadOsSettings
+from . import touchSettings
 from . import virtualDesktop
-from .trackpadTouch import TrackpadTouchScreen
-
-_SOUNDS_DIR = os.path.join(os.path.dirname(__file__), "sounds")
-EXPLORE_SOUND_PATH = os.path.join(_SOUNDS_DIR, "explore.wav")
-CLICK_SOUND_PATH = os.path.join(_SOUNDS_DIR, "click.wav")
-
-
-def _playSound(path: str) -> None:
-	"""Plays a bundled UI sound asynchronously, matching how NVDA plays its
-	own built-in sounds (waves/*.wav via nvwave.playWaveFile). Sounds are
-	WAV, not the MP3 they were originally supplied as - nvwave.playWaveFile
-	uses the stdlib wave module internally (wave.open(fileName, "r")),
-	which only reads WAV; there is no MP3 decoding anywhere in NVDA itself,
-	and this add-on has no external dependencies to add one. Converted once
-	with ffmpeg to 22050 Hz mono 16-bit PCM, matching NVDA's own waves/*.wav
-	files exactly (confirmed by inspecting one, e.g. waves/browseMode.wav)
-	rather than guessing a format nvwave would accept.
-	"""
-	try:
-		nvwave.playWaveFile(path)
-	except Exception:
-		log.debugWarning(f"touchExplore: failed to play sound {path!r}", exc_info=True)
+from .trackpadTouch import NoTouchpadFoundError, TrackpadTouchScreen
 
 # Roles that are "generic containers": their own announcement (name, role,
 # row/column counts) is a waypoint, not content. This is true whether the
@@ -174,12 +156,22 @@ def _activateObject(obj, gesture) -> None:
 	while obj and not objectBelowLockScreenAndWindowsIsLocked(obj):
 		try:
 			obj.doAction()
-			_playSound(CLICK_SOUND_PATH)
+			audioCues.play(audioCues.ACTIVATE, *audioCues.centreOf(obj))
 			if isinstance(gesture, touchHandler.TouchInputGesture):
 				touchHandler.handler.notifyInteraction(obj)
 			return
 		except NotImplementedError:
 			obj = obj.parent
+
+
+def _gesturePoint(gesture):
+	"""Screen position a touch gesture happened at (for panning its cue), or
+	(None, None) - e.g. for the keyboard bindings some of these scripts share.
+	"""
+	tracker = getattr(gesture, "tracker", None)
+	if tracker is None:
+		return (None, None)
+	return (tracker.x, tracker.y)
 
 
 def _navigateAndAnnounce(newObj) -> None:
@@ -220,6 +212,7 @@ def _navigateAndAnnounce(newObj) -> None:
 
 		ui.reviewMessage(gui.blockAction.Context.WINDOWS_LOCKED.translatedMessage)
 		return
+	audioCues.playForObject(newObj)
 	onCurrentDesktop = virtualDesktop.isOnCurrentVirtualDesktop(getattr(newObj, "windowHandle", None))
 	if onCurrentDesktop is False:
 		log.debug(
@@ -255,9 +248,8 @@ def _navigateAndAnnounce(newObj) -> None:
 # behaved correctly (pure time-interval overlap; not the actual culprit -
 # multi-finger flicks, which don't have a drift ceiling, always merged
 # correctly in the same test session).
-_originalMaxAccidentalDrift = touchTracker.maxAccidentalDrift
-_PATCHED_MAX_ACCIDENTAL_DRIFT = 25
-_driftPatched = False
+# Now configurable, in millimetres per input source rather than a fixed
+# 25px: see touchSettings.py ("Tap movement tolerance").
 # --- end multi-finger tap fix -------------------------------------------
 
 
@@ -283,9 +275,8 @@ _driftPatched = False
 # doesn't match real human timing" fix as the drift patch above, and
 # extended module-globally the same way, applying to real touchscreen
 # gestures too, not just trackpad mode (accepted; see CLAUDE.md).
-_originalMultitouchTimeout = touchTracker.multitouchTimeout
-_PATCHED_MULTITOUCH_TIMEOUT = 0.4
-_timeoutPatched = False
+# Now configurable per input source (default still 0.4s): see
+# touchSettings.py ("Gesture time").
 # --- end tap/flick classification timeout fix ---------------------------
 
 
@@ -296,6 +287,9 @@ _patched = False
 # exact back-to-back repeats that arise from an item being reachable via both
 # the object path (focus/selection) and the text/cell path (speakTextInfo).
 _lastSpokenKey = None
+# Whether the previous _patchedMoveTo hit was a real item (not a container),
+# for the gap cue.
+_lastHitWasItem = False
 
 
 def _isContainerHit(obj) -> bool:
@@ -350,7 +344,7 @@ def _patchedMoveTo(self, x, y, new=False, unit=textInfos.UNIT_LINE):
 	if pos and self.updateReview:
 		api.setReviewPosition(pos)
 
-	global _lastSpokenKey
+	global _lastSpokenKey, _lastHitWasItem
 
 	if containerHit:
 		# A generic container hit: either genuinely empty space, or the
@@ -360,7 +354,15 @@ def _patchedMoveTo(self, x, y, new=False, unit=textInfos.UNIT_LINE):
 		# finger reaches a real item.
 		if pos:
 			self._pos = pos
+		# One faint tick when the finger slides off an item into such a gap,
+		# so empty space is distinguishable from "still on the same item"
+		# (both are otherwise silent). Only on the transition, never
+		# repeated while moving around inside the gap.
+		if hasNewObj and _lastHitWasItem and config.conf["touchExplore"]["gapSound"]:
+			audioCues.play(audioCues.GAP, x, y)
+		_lastHitWasItem = False
 		return
+	_lastHitWasItem = True
 
 	posChanged = bool(
 		pos
@@ -394,7 +396,7 @@ def _patchedMoveTo(self, x, y, new=False, unit=textInfos.UNIT_LINE):
 	if hasNewObj and objKey is not None and not objectBelowLockScreenAndWindowsIsLocked(obj):
 		speech.cancelSpeech()
 		speechCanceled = True
-		_playSound(EXPLORE_SOUND_PATH)
+		audioCues.playForObject(obj, x, y)
 		# Actually move focus and selection to obj (VoiceOver-style
 		# touch-explore) rather than speaking it ourselves. This triggers a
 		# real OS focus/selection change, which NVDA's own event hooks pick
@@ -422,39 +424,44 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 
 	def __init__(self):
 		super().__init__()
-		global _patched, _driftPatched, _timeoutPatched
+		global _patched
 		if not _patched:
 			screenExplorer.ScreenExplorer.moveTo = _patchedMoveTo
 			_patched = True
 			log.debug("touchExplore: patched ScreenExplorer.moveTo")
-		if not _driftPatched:
-			touchTracker.maxAccidentalDrift = _PATCHED_MAX_ACCIDENTAL_DRIFT
-			_driftPatched = True
-			log.debug("touchExplore: raised touchTracker.maxAccidentalDrift")
-		if not _timeoutPatched:
-			touchTracker.multitouchTimeout = _PATCHED_MULTITOUCH_TIMEOUT
-			_timeoutPatched = True
-			log.debug("touchExplore: raised touchTracker.multitouchTimeout")
 		self._trackpadTouchScreen = None
 		self._savedMouseTrackingEnabled = None
+		touchSettings.registerConfig()
+		touchSettings.applyTouchscreen()
+		config.post_configProfileSwitch.register(self._onConfigProfileSwitch)
+		gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(settingsUI.TouchExploreSettingsPanel)
 
 	def terminate(self):
-		global _patched, _driftPatched, _timeoutPatched
+		global _patched
 		if self._trackpadTouchScreen is not None:
 			self._disableTrackpadTouchScreen()
 		if _patched:
 			screenExplorer.ScreenExplorer.moveTo = _originalMoveTo
 			_patched = False
 			log.debug("touchExplore: restored original ScreenExplorer.moveTo")
-		if _driftPatched:
-			touchTracker.maxAccidentalDrift = _originalMaxAccidentalDrift
-			_driftPatched = False
-			log.debug("touchExplore: restored original touchTracker.maxAccidentalDrift")
-		if _timeoutPatched:
-			touchTracker.multitouchTimeout = _originalMultitouchTimeout
-			_timeoutPatched = False
-			log.debug("touchExplore: restored original touchTracker.multitouchTimeout")
+		config.post_configProfileSwitch.unregister(self._onConfigProfileSwitch)
+		try:
+			gui.settingsDialogs.NVDASettingsDialog.categoryClasses.remove(settingsUI.TouchExploreSettingsPanel)
+		except ValueError:
+			pass
+		touchSettings.restoreOriginals()
+		audioCues.terminate()
 		super().terminate()
+
+	def _onConfigProfileSwitch(self):
+		# Profiles can hold different touch settings. The trackpad's are
+		# re-converted at the start of its next gesture anyway (the monitor
+		# may differ); re-applying now just makes the switch take effect
+		# immediately.
+		if self._trackpadTouchScreen is None:
+			touchSettings.applyTouchscreen()
+		else:
+			touchSettings.reapply()
 
 	def _enableTrackpadTouchScreen(self):
 		mode = touchHandler.handler._curTouchMode if touchHandler.handler else "object"
@@ -487,6 +494,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		touchpadOsSettings.restoreOsGestures()
 		self._trackpadTouchScreen.stop()
 		self._trackpadTouchScreen = None
+		# Back to the touchscreen's thresholds (the trackpad's were applied at
+		# the start of each trackpad gesture - see trackpadTouch.py).
+		touchSettings.applyTouchscreen()
 		if self._savedMouseTrackingEnabled is not None:
 			config.conf["mouse"]["enableMouseTracking"] = self._savedMouseTrackingEnabled
 			self._savedMouseTrackingEnabled = None
@@ -507,6 +517,14 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if self._trackpadTouchScreen is None:
 			try:
 				self._enableTrackpadTouchScreen()
+			except NoTouchpadFoundError:
+				log.debugWarning("touchExplore: no Precision Touchpad found", exc_info=True)
+				self._trackpadTouchScreen = None
+				# Translators: reported when trackpad-as-touchscreen mode can't
+				# start because the machine has no Windows Precision Touchpad
+				# (e.g. its touchpad uses an older vendor driver).
+				ui.message(_("No Precision Touchpad found; trackpad touchscreen mode needs one"))
+				return
 			except Exception:
 				log.error("touchExplore: failed to enable trackpad-as-touchscreen mode", exc_info=True)
 				self._trackpadTouchScreen = None
@@ -514,12 +532,137 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				# fails to start (e.g. no supported touchpad found).
 				ui.message(_("Could not enable trackpad touchscreen mode"))
 				return
+			audioCues.play(audioCues.ON)
 			# Translators: reported when trackpad-as-touchscreen mode is turned on.
 			ui.message(_("Trackpad touchscreen mode on"))
 		else:
 			self._disableTrackpadTouchScreen()
+			audioCues.play(audioCues.OFF)
 			# Translators: reported when trackpad-as-touchscreen mode is turned off.
 			ui.message(_("Trackpad touchscreen mode off"))
+
+	@script(
+		# Translators: Input help mode message for the touch calibration command.
+		description=_(
+			"Opens touch calibration, which measures how you tap and flick on the "
+			"touch input currently in use and adjusts the gesture settings to match",
+		),
+	)
+	def script_startTouchCalibration(self, gesture):
+		# No default gesture - assignable in Input Gestures. Also reachable
+		# from NVDA Settings > Touch Explore.
+		wx.CallAfter(settingsUI.openCalibration)
+
+	@script(
+		# Translators: Input help mode message for the touch diagnostics command.
+		description=_("Copies touch and trackpad diagnostic information to the clipboard, for bug reports"),
+	)
+	def script_copyTouchDiagnostics(self, gesture):
+		text = diagnostics.collect(self._trackpadTouchScreen)
+		if api.copyToClip(text):
+			# Translators: reported after the touch diagnostics were copied.
+			ui.message(_("Touch diagnostics copied to clipboard"))
+		else:
+			# Translators: reported when copying the touch diagnostics failed.
+			ui.message(_("Could not copy touch diagnostics"))
+
+	# --- Additional VoiceOver-inspired touch gestures ---------------------
+	# All on gesture IDs NVDA 2026.2's globalCommands leaves unbound (checked
+	# against the release-2026.2 source): 2finger_tap, 3finger_double_tap,
+	# 3finger_flickup/down in object mode (text mode's 3finger_flickDown is
+	# stock say-all, untouched), 2finger_triple_tap, and 2finger_pinchin/out
+	# (pinch trackers are always numFingers=2, so the ID carries "2finger_").
+	# Every one is reassignable in Input Gestures.
+
+	@script(
+		# Translators: Input help mode message for the stop speech touch gesture.
+		description=_("Stops speech"),
+		gestures=("ts:2finger_tap",),
+	)
+	def script_touchStopSpeech(self, gesture):
+		speech.cancelSpeech()
+
+	@script(
+		# Translators: Input help mode message for the speech on/off touch gesture.
+		description=_("Turns speech off, or back on"),
+		gestures=("ts:3finger_double_tap",),
+	)
+	def script_touchToggleSpeech(self, gesture):
+		SpeechMode = speech.SpeechMode
+		if speech.getState().speechMode == SpeechMode.off:
+			speech.setSpeechMode(SpeechMode.talk)
+			audioCues.play(audioCues.ON)
+			# Translators: reported when speech is turned back on by touch gesture.
+			ui.message(_("Speech on"))
+		else:
+			# The cue is the only feedback once speech is off.
+			speech.cancelSpeech()
+			audioCues.play(audioCues.OFF)
+			speech.setSpeechMode(SpeechMode.off)
+
+	def _sendKeyWithCue(self, keyName, cue, gesture):
+		from keyboardHandler import KeyboardInputGesture
+
+		audioCues.play(cue, *_gesturePoint(gesture))
+		KeyboardInputGesture.fromName(keyName).send()
+
+	@script(
+		# Translators: Input help mode message for the scroll down touch gesture.
+		description=_("Scrolls down one page (Page Down)"),
+		gestures=("ts(object):3finger_flickup",),
+	)
+	def script_touchPageDown(self, gesture):
+		# Flick up moves the content up, i.e. shows what's further down -
+		# VoiceOver's direction for the same three-finger swipe.
+		self._sendKeyWithCue("pageDown", audioCues.SCROLL, gesture)
+
+	@script(
+		# Translators: Input help mode message for the scroll up touch gesture.
+		description=_("Scrolls up one page (Page Up)"),
+		gestures=("ts(object):3finger_flickdown",),
+	)
+	def script_touchPageUp(self, gesture):
+		self._sendKeyWithCue("pageUp", audioCues.SCROLL, gesture)
+
+	@script(
+		# Translators: Input help mode message for the media play/pause touch gesture.
+		description=_("Plays or pauses media"),
+		gestures=("ts:2finger_triple_tap",),
+	)
+	def script_touchMediaPlayPause(self, gesture):
+		self._sendKeyWithCue("mediaPlayPause", audioCues.ACTIVATE, gesture)
+
+	def _changeSpeechRate(self, delta):
+		import synthDriverHandler
+
+		synth = synthDriverHandler.getSynth()
+		if not synth or not synth.isSupported("rate"):
+			# Translators: reported when the current synthesizer has no rate setting.
+			ui.message(_("Speech rate can't be changed"))
+			return
+		rate = max(0, min(100, synth.rate + delta))
+		# Stored exactly the way NVDA's own synth settings ring stores a
+		# change (synthSettingsRing.SettingInfo._set_value).
+		synth.rate = rate
+		config.conf["speech"][synth.name]["rate"] = rate
+		# Translators: reported after changing the speech rate by pinching; {rate} is 0-100.
+		ui.message(_("Rate {rate}").format(rate=rate))
+
+	@script(
+		# Translators: Input help mode message for the faster speech touch gesture.
+		description=_("Makes speech faster"),
+		gestures=("ts:2finger_pinchout",),
+	)
+	def script_touchSpeechFaster(self, gesture):
+		self._changeSpeechRate(5)
+
+	@script(
+		# Translators: Input help mode message for the slower speech touch gesture.
+		description=_("Makes speech slower"),
+		gestures=("ts:2finger_pinchin",),
+	)
+	def script_touchSpeechSlower(self, gesture):
+		self._changeSpeechRate(-5)
 
 	@script(
 		# Translators: Input help mode message for the split-tap activation
@@ -573,7 +716,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		try:
 			pos.activate()
 			if isTouch:
-				_playSound(CLICK_SOUND_PATH)
+				audioCues.play(audioCues.ACTIVATE, *_gesturePoint(gesture))
 				touchHandler.handler.notifyInteraction(pos.NVDAObjectAtStart)
 			return
 		except NotImplementedError:
@@ -583,7 +726,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			try:
 				obj.doAction()
 				if isTouch:
-					_playSound(CLICK_SOUND_PATH)
+					audioCues.play(audioCues.ACTIVATE, *_gesturePoint(gesture))
 					touchHandler.handler.notifyInteraction(obj)
 				return
 			except NotImplementedError:
@@ -641,6 +784,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if newObject is None:
 			# Translators: Reported when there is no containing (parent)
 			# object such as when focused on desktop.
+			audioCues.play(audioCues.BOUNDARY)
 			ui.reviewMessage(_("No containing object"))
 			return
 		_navigateAndAnnounce(newObject)
@@ -661,6 +805,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if newObject is None:
 			# Translators: Reported when there is no contained (first
 			# child) object such as inside a document.
+			audioCues.play(audioCues.BOUNDARY)
 			ui.reviewMessage(_("No objects inside"))
 			return
 		_navigateAndAnnounce(newObject)
@@ -681,6 +826,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if newObject is None:
 			# Translators: Reported when there is no next object (current
 			# object is the last object).
+			audioCues.play(audioCues.BOUNDARY)
 			ui.reviewMessage(_("No next"))
 			return
 		_navigateAndAnnounce(newObject)
@@ -701,6 +847,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if newObject is None:
 			# Translators: Reported when there is no previous object
 			# (current object is the first object).
+			audioCues.play(audioCues.BOUNDARY)
 			ui.reviewMessage(_("No previous"))
 			return
 		_navigateAndAnnounce(newObject)
@@ -729,6 +876,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				newObject = parent.simpleNext
 		if not newObject:
 			# Translators: a message when there is no next object when navigating
+			audioCues.play(audioCues.BOUNDARY)
 			ui.reviewMessage(_("No next"))
 			return
 		_navigateAndAnnounce(newObject)
@@ -752,6 +900,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			newObject = curObject.simpleParent
 		if not newObject:
 			# Translators: a message when there is no previous object when navigating
+			audioCues.play(audioCues.BOUNDARY)
 			ui.reviewMessage(_("No previous"))
 			return
 		_navigateAndAnnounce(newObject)

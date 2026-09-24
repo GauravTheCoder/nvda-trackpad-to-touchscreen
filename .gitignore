@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 *.log
+resources/sounds/earcon-audition.wav

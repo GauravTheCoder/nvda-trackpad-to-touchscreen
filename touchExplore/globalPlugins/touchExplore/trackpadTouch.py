@@ -35,13 +35,22 @@
 #     50-byte reports) - they are independent report descriptors and must
 #     not be cross-matched; HidP_GetUsageValue against the wrong preparsed
 #     data fails with HIDP_STATUS_INCOMPATIBLE_REPORT_ID.
-#   - The Windows Precision Touchpad spec documents Tip Switch (0x0D, 0x42)
-#     as mandatory, but this hardware's report doesn't expose it at all
-#     ((0x0D, 0x30) is Pressure, not Tip - easy to confuse, confirmed
-#     against the Windows Precision Touchpad Collection reference
-#     touchpad-windows-precision-touchpad-collection). Contact liveness is
-#     therefore determined from the device-level Contact Count usage
-#     (0x0D, 0x54) instead - see _DeviceParser.decodeContacts.
+#   - Tip Switch (0x0D, 0x42) and Confidence (0x0D, 0x47) are 1-bit BUTTON
+#     usages, not values - they only show up via HidP_GetButtonCaps/
+#     HidP_GetUsages, never via HidP_GetValueCaps. (An earlier version of
+#     this add-on concluded from a value-caps-only dump that this hardware
+#     had no Tip Switch at all; a button-caps probe later showed it does -
+#     Tip, Confidence and In Range (0x32) on every contact link collection.)
+#     Contact liveness is based on the device-level Contact Count usage
+#     (0x0D, 0x54), refined by Tip/Confidence whenever the device exposes
+#     them - see _DeviceParser.decode and TrackpadTouchScreen._applyFrame.
+#   - Hybrid reporting mode (spec: a device with fewer contact slots per
+#     report than contacts it tracks splits one frame across several
+#     reports; only the first carries the real Contact Count, the rest
+#     report 0, all share the same Scan Time) is reassembled by
+#     _FrameAssembler. Not exercised by the development hardware (5 slots
+#     per report, parallel mode), so kept strictly additive: a device that
+#     always fits a frame in one report behaves exactly as before.
 #   - A capability-only CreateFileW open of a HID device (dwDesiredAccess=0)
 #     succeeds even while the OS's own touchpad driver holds the device for
 #     read/write; requesting GENERIC_READ|GENERIC_WRITE fails with
@@ -53,6 +62,7 @@
 #     fresh device search (by UsagePage/Usage, and for the PnP fallback
 #     path also VendorId/ProductId) must be done each time this starts.
 
+import itertools
 import threading
 import time
 from ctypes import (
@@ -85,6 +95,7 @@ from ctypes.wintypes import (
 	WPARAM,
 )
 
+import config
 import core
 import gui
 import inputCore
@@ -93,6 +104,8 @@ import touchHandler
 import touchTracker
 import winUser
 from logHandler import log
+
+from . import monitors, touchSettings
 
 user32 = windll.user32
 kernel32 = windll.kernel32
@@ -131,17 +144,34 @@ POLL_TIMER_ID = 1
 # motionless hold - accepted tradeoff after asking the user directly, since
 # taps/flicks were the reported-broken behavior and holds were not.
 LIFT_INFERENCE_TIMEOUT_S = 0.08
+# LIFT_INFERENCE_TIMEOUT_S is a floor, tuned on hardware reporting every few
+# milliseconds. A slower device (some Bluetooth/low-power touchpads report far
+# less often) could go 80ms between two perfectly ordinary reports for a
+# finger that's still down, so the effective timeout also scales with each
+# device's own measured report interval: this many typical intervals without
+# a real report counts as a lift.
+LIFT_INFERENCE_REPORT_INTERVALS = 8
+# Gaps between consecutive real reports longer than this are "the hardware
+# went quiet" (see above), not the device's report rate, and are excluded
+# from the report-interval average.
+MAX_REPORT_INTERVAL_SAMPLE_S = 0.25
 RID_INPUT = 0x10000003
 RIDEV_INPUTSINK = 0x00000100
 RIDEV_REMOVE = 0x00000001
 RIDEV_NOLEGACY = 0x00000030
+RIDEV_DEVNOTIFY = 0x00002000
+WM_INPUT_DEVICE_CHANGE = 0x00FE
+GIDC_ARRIVAL = 1
+GIDC_REMOVAL = 2
+# Used to convert millimetre thresholds only when a touchpad doesn't declare
+# its physical size (the spec requires it, so this should be rare): a typical
+# laptop Precision Touchpad.
+FALLBACK_PAD_SIZE_MM = (105.0, 70.0)
 RIM_TYPEHID = 2
 RIDI_DEVICENAME = 0x20000007
 RIDI_DEVICEINFO = 0x2000000B
 RIDI_PREPARSEDDATA = 0x20000005
 HWND_MESSAGE = -3
-SM_CXSCREEN = 0
-SM_CYSCREEN = 1
 
 GENERIC_ZERO_ACCESS = 0
 FILE_SHARE_READ = 1
@@ -150,6 +180,10 @@ OPEN_EXISTING = 3
 
 HidP_Input = 0
 HIDP_STATUS_SUCCESS = 0x00110000
+# Upper bound on how many digitizer-page buttons one contact link collection
+# can have set at once (Tip, Confidence, In Range, ... - 3 on the development
+# hardware); generous so HidP_GetUsages never reports BUFFER_TOO_SMALL.
+_MAX_USAGES_PER_LINK_COLLECTION = 32
 
 USAGE_PAGE_DIGITIZER = 0x0D
 USAGE_TOUCHPAD = 0x05
@@ -157,8 +191,18 @@ USAGE_PAGE_GENERIC_DESKTOP = 0x01
 USAGE_MOUSE = 0x02
 USAGE_X = 0x30
 USAGE_Y = 0x31
+USAGE_TIP_SWITCH = 0x42
+USAGE_CONFIDENCE = 0x47
 USAGE_CONTACT_ID = 0x51
 USAGE_CONTACT_COUNT = 0x54
+USAGE_SCAN_TIME = 0x56
+
+
+class NoTouchpadFoundError(RuntimeError):
+	"""No Windows Precision Touchpad digitizer collection is present - e.g. a
+	touchpad using an older vendor (Synaptics/Elan/ALPS) mouse-emulation
+	driver, which never exposes Usage Page 0x0D / Usage 0x05 at all.
+	"""
 
 
 class RAWINPUTDEVICE(Structure):
@@ -263,6 +307,29 @@ class HIDP_VALUE_CAPS(Structure):
 	]
 
 
+class HIDP_BUTTON_CAPS(Structure):
+	# 72 bytes, same union trick as HIDP_VALUE_CAPS: Range.UsageMin/UsageMax
+	# alias NotRange.Usage/Reserved1, so a non-range cap reads as
+	# UsageMin == its usage.
+	_fields_ = [
+		("UsagePage", USHORT),
+		("ReportID", c_ubyte),
+		("IsAlias", BOOLEAN),
+		("BitField", USHORT),
+		("LinkCollection", USHORT),
+		("LinkUsage", USHORT),
+		("LinkUsagePage", USHORT),
+		("IsRange", BOOLEAN),
+		("IsStringRange", BOOLEAN),
+		("IsDesignatorRange", BOOLEAN),
+		("IsAbsolute", BOOLEAN),
+		("ReportCount", USHORT),
+		("Reserved2", USHORT),
+		("Reserved", ULONG * 9),
+		("RangeOrNotRange", _HIDP_VALUE_CAPS_RANGE),
+	]
+
+
 # Explicit argtypes/restype for every Win32 function this module calls.
 # ctypes' default (untyped) marshaling guesses too narrow a C type for
 # 64-bit pointer/handle values (e.g. a >2GB module base address or window
@@ -338,6 +405,19 @@ hidDll.HidP_GetCaps.argtypes = [c_void_p, POINTER(HIDP_CAPS)]
 hidDll.HidP_GetCaps.restype = c_long
 hidDll.HidP_GetValueCaps.argtypes = [c_int, POINTER(HIDP_VALUE_CAPS), POINTER(USHORT), c_void_p]
 hidDll.HidP_GetValueCaps.restype = c_long
+hidDll.HidP_GetButtonCaps.argtypes = [c_int, POINTER(HIDP_BUTTON_CAPS), POINTER(USHORT), c_void_p]
+hidDll.HidP_GetButtonCaps.restype = c_long
+hidDll.HidP_GetUsages.argtypes = [
+	c_int,
+	USHORT,
+	USHORT,
+	POINTER(USHORT),
+	POINTER(ULONG),
+	c_void_p,
+	c_void_p,
+	ULONG,
+]
+hidDll.HidP_GetUsages.restype = c_long
 hidDll.HidP_GetUsageValue.argtypes = [
 	c_int,
 	USHORT,
@@ -351,83 +431,250 @@ hidDll.HidP_GetUsageValue.argtypes = [
 hidDll.HidP_GetUsageValue.restype = c_long
 
 
+def _physicalMM(valueCaps):
+	"""Physical extent in millimetres of one value cap, from its HID
+	Physical Min/Max, Unit and Unit Exponent - which the Precision Touchpad
+	spec requires for X and Y. Unit's low nibble is the unit system (1 = SI
+	linear: length in centimetres; 3 = English linear: length in inches) and
+	its next nibble the length dimension's power (must be 1); Unit Exponent
+	is a 4-bit two's-complement power of ten. Development hardware: Physical
+	0..11999, Unit 0x11 (SI linear, cm), exponent 0xD (-3) -> 120mm wide.
+	Returns None for anything else (unknown units, or no physical range).
+	"""
+	system = valueCaps.Units & 0xF
+	lengthPower = (valueCaps.Units >> 4) & 0xF
+	if lengthPower != 1 or system not in (1, 3):
+		return None
+	span = valueCaps.PhysicalMax - valueCaps.PhysicalMin
+	if span <= 0:
+		return None
+	exponent = valueCaps.UnitsExp & 0xF
+	if exponent >= 8:
+		exponent -= 16
+	mm = span * (10**exponent) * (10.0 if system == 1 else 25.4)
+	# Plausibility: a touch surface between 1cm and 1m.
+	return mm if 10 <= mm <= 1000 else None
+
+
+_CONTACT_VALUE_USAGES = (
+	(USAGE_PAGE_DIGITIZER, USAGE_CONTACT_ID),
+	(USAGE_PAGE_GENERIC_DESKTOP, USAGE_X),
+	(USAGE_PAGE_GENERIC_DESKTOP, USAGE_Y),
+)
+
+
 class _DeviceParser:
-	"""Caches a touchpad raw-input device's preparsed HID data and value
-	capabilities, and decodes contacts out of its raw reports.
+	"""Caches a touchpad raw-input device's preparsed HID data and the
+	capabilities this add-on reads, and decodes contact slots out of its raw
+	reports.
 	"""
 
-	def __init__(self, preparsedDataBuf, valueCaps, reportByteLength):
+	def __init__(self, preparsedDataBuf, valueCaps, buttonCaps, reportByteLength):
 		# Keep the buffer itself alive for as long as this parser is used -
 		# self._preparsedData is only a non-owning c_void_p view into it.
 		self._preparsedDataBuf = preparsedDataBuf
 		self._preparsedData = cast(preparsedDataBuf, c_void_p)
-		self._valueCaps = valueCaps
 		self.reportByteLength = reportByteLength
+		# (linkCollection, (usagePage, usage)) -> (logicalMin, logicalMax) for
+		# only the per-contact usages actually needed - decoding every value
+		# cap (Width, Height, Azimuth, Pressure, ...) on every report was pure
+		# overhead.
+		self._ranges = {}
+		deviceLevelUsages = set()
+		# Physical extent per axis in millimetres (first slot that declares
+		# one), for converting millimetre thresholds to pixels - see
+		# touchSettings.py and _physicalMM.
+		self._physicalMM = {}
+		for vc in valueCaps:
+			key = (vc.UsagePage, vc.RangeOrNotRange.UsageMin)
+			if vc.LinkCollection == 0:
+				deviceLevelUsages.add(key)
+			elif key in _CONTACT_VALUE_USAGES:
+				self._ranges[(vc.LinkCollection, key)] = (vc.LogicalMin, vc.LogicalMax)
+				if key[0] == USAGE_PAGE_GENERIC_DESKTOP and key not in self._physicalMM:
+					sizeMM = _physicalMM(vc)
+					if sizeMM:
+						self._physicalMM[key] = sizeMM
+		self.hasScanTime = (USAGE_PAGE_DIGITIZER, USAGE_SCAN_TIME) in deviceLevelUsages
+		# Contact slots: link collections carrying Contact ID + X + Y, in
+		# ascending LinkCollection order (= reported slot order, per the
+		# spec's example).
+		self.slotLinkCollections = sorted(
+			lc
+			for lc in {lc for (lc, _key) in self._ranges}
+			if all((lc, key) in self._ranges for key in _CONTACT_VALUE_USAGES)
+		)
+		# Tip/Confidence are 1-bit buttons (see module docstring). Only
+		# trusted for a slot whose link collection actually declares them -
+		# otherwise "not among the pressed buttons" would wrongly read as
+		# tip-up / not-confident on a device that simply lacks the usage.
+		self._tipLinkCollections = set()
+		self._confidenceLinkCollections = set()
+		for bc in buttonCaps:
+			if bc.UsagePage != USAGE_PAGE_DIGITIZER:
+				continue
+			lo = bc.RangeOrNotRange.UsageMin
+			hi = bc.RangeOrNotRange.UsageMax if bc.IsRange else lo
+			if lo <= USAGE_TIP_SWITCH <= hi:
+				self._tipLinkCollections.add(bc.LinkCollection)
+			if lo <= USAGE_CONFIDENCE <= hi:
+				self._confidenceLinkCollections.add(bc.LinkCollection)
 
-	def decodeContacts(self, reportBytes):
-		"""Returns {contactId: (xProportion, yProportion)} for the currently
-		down contacts in this report, where each proportion is in
-		[0.0, 1.0] relative to the touchpad surface, computed from the
-		device's own per-axis logical min/max.
-
-		Contact liveness is determined by the device-level Contact Count
-		usage (0x0D/0x54), not by a per-contact Tip Switch usage (0x0D/0x42):
-		confirmed by instrumented testing that the hardware this add-on was
-		developed against does not expose a Tip Switch usage in its raw
-		HID report at all (its value caps list only Contact ID, X, Y, Width,
-		Height, Azimuth and Pressure per contact link collection), even
-		though Tip Switch is documented as mandatory for a spec-compliant
-		Windows Precision Touchpad - contact link collections beyond the
-		live count still report their last real X/Y rather than zeros once
-		a finger lifts, so treating "present" as "live" produces stale
-		phantom contacts. Link collections are populated in ascending
-		numeric order by contact slot per the spec's example, so the first
-		contactCount link collections (by LinkCollection number, i.e.
-		reported slot order, not by comparing contact IDs) are the live
-		ones.
+	@property
+	def sizeMM(self):
+		"""(widthMM, heightMM) of the touch surface, or None if the device
+		doesn't declare usable physical units for both axes.
 		"""
-		byLinkCollection = {}
-		reportBuf = create_string_buffer(reportBytes, len(reportBytes))
-		for vc in self._valueCaps:
-			usage = vc.RangeOrNotRange.UsageMin
-			value = ULONG(0)
-			status = hidDll.HidP_GetUsageValue(
-				HidP_Input,
-				vc.UsagePage,
-				vc.LinkCollection,
-				usage,
-				byref(value),
-				self._preparsedData,
-				reportBuf,
-				len(reportBytes),
-			)
-			if status != HIDP_STATUS_SUCCESS:
-				continue
-			byLinkCollection.setdefault(vc.LinkCollection, {})[(vc.UsagePage, usage)] = (
-				value.value,
-				vc.LogicalMin,
-				vc.LogicalMax,
-			)
+		width = self._physicalMM.get((USAGE_PAGE_GENERIC_DESKTOP, USAGE_X))
+		height = self._physicalMM.get((USAGE_PAGE_GENERIC_DESKTOP, USAGE_Y))
+		return (width, height) if width and height else None
 
-		deviceLevel = byLinkCollection.get(0, {})
-		contactCountEntry = deviceLevel.get((USAGE_PAGE_DIGITIZER, USAGE_CONTACT_COUNT))
-		contactCount = contactCountEntry[0] if contactCountEntry else 0
+	def describe(self):
+		return (
+			f"slots={self.slotLinkCollections} tip={sorted(self._tipLinkCollections)} "
+			f"confidence={sorted(self._confidenceLinkCollections)} scanTime={self.hasScanTime} "
+			f"sizeMM={tuple(round(v, 1) for v in self.sizeMM) if self.sizeMM else None} "
+			f"reportLen={self.reportByteLength}"
+		)
 
-		contacts = {}
-		for linkCollection in sorted(lc for lc in byLinkCollection if lc != 0)[:contactCount]:
-			fields = byLinkCollection[linkCollection]
-			cidEntry = fields.get((USAGE_PAGE_DIGITIZER, USAGE_CONTACT_ID))
-			xEntry = fields.get((USAGE_PAGE_GENERIC_DESKTOP, USAGE_X))
-			yEntry = fields.get((USAGE_PAGE_GENERIC_DESKTOP, USAGE_Y))
-			if cidEntry is None or xEntry is None or yEntry is None:
+	def _getValue(self, reportBuf, reportLen, usagePage, linkCollection, usage):
+		value = ULONG(0)
+		status = hidDll.HidP_GetUsageValue(
+			HidP_Input,
+			usagePage,
+			linkCollection,
+			usage,
+			byref(value),
+			self._preparsedData,
+			reportBuf,
+			reportLen,
+		)
+		return value.value if status == HIDP_STATUS_SUCCESS else None
+
+	def _getPressedDigitizerButtons(self, reportBuf, reportLen, linkCollection):
+		usageList = (USHORT * _MAX_USAGES_PER_LINK_COLLECTION)()
+		usageLength = ULONG(_MAX_USAGES_PER_LINK_COLLECTION)
+		status = hidDll.HidP_GetUsages(
+			HidP_Input,
+			USAGE_PAGE_DIGITIZER,
+			linkCollection,
+			usageList,
+			byref(usageLength),
+			self._preparsedData,
+			reportBuf,
+			reportLen,
+		)
+		if status != HIDP_STATUS_SUCCESS:
+			return None
+		return set(usageList[: usageLength.value])
+
+	def decode(self, reportBytes):
+		"""Decodes one raw report. Returns None if it isn't a contact report
+		this parser understands at all (e.g. a different Report ID arriving
+		through the same collection: HidP_GetUsageValue fails with
+		HIDP_STATUS_INCOMPATIBLE_REPORT_ID) - such a report must be ignored,
+		not read as "zero contacts", which would lift every finger.
+
+		Otherwise returns (contactCount, scanTime, slots): contactCount from
+		the device-level Contact Count usage (0x0D/0x54); scanTime from Scan
+		Time (0x0D/0x56), None if the device lacks it; and slots, one entry
+		per contact link collection in slot order - either None (that slot's
+		values couldn't be read) or (contactId, xProportion, yProportion,
+		tip, confident), proportions in [0.0, 1.0] from the device's own
+		logical min/max, tip/confident True/False, or None where the device
+		doesn't declare that usage for the slot.
+
+		Which slots are live is decided by the caller (_FrameAssembler, then
+		TrackpadTouchScreen._applyFrame), not here: slots beyond the live
+		count keep reporting their last real X/Y rather than zeros once a
+		finger lifts (confirmed on the development hardware), and in hybrid
+		reporting mode the live count spans more than one report.
+		"""
+		reportLen = len(reportBytes)
+		reportBuf = create_string_buffer(reportBytes, reportLen)
+		contactCount = self._getValue(reportBuf, reportLen, USAGE_PAGE_DIGITIZER, 0, USAGE_CONTACT_COUNT)
+		if contactCount is None:
+			return None
+		scanTime = None
+		if self.hasScanTime:
+			scanTime = self._getValue(reportBuf, reportLen, USAGE_PAGE_DIGITIZER, 0, USAGE_SCAN_TIME)
+		slots = []
+		for linkCollection in self.slotLinkCollections:
+			contactId, xValue, yValue = (
+				self._getValue(reportBuf, reportLen, page, linkCollection, usage)
+				for (page, usage) in _CONTACT_VALUE_USAGES
+			)
+			if contactId is None or xValue is None or yValue is None:
+				slots.append(None)
 				continue
-			contactId = cidEntry[0]
-			xValue, xMin, xMax = xEntry
-			yValue, yMin, yMax = yEntry
+			xMin, xMax = self._ranges[(linkCollection, (USAGE_PAGE_GENERIC_DESKTOP, USAGE_X))]
+			yMin, yMax = self._ranges[(linkCollection, (USAGE_PAGE_GENERIC_DESKTOP, USAGE_Y))]
 			xProportion = (xValue - xMin) / (xMax - xMin) if xMax > xMin else 0.0
 			yProportion = (yValue - yMin) / (yMax - yMin) if yMax > yMin else 0.0
-			contacts[contactId] = (xProportion, yProportion)
-		return contacts
+			tip = confident = None
+			hasTip = linkCollection in self._tipLinkCollections
+			hasConfidence = linkCollection in self._confidenceLinkCollections
+			if hasTip or hasConfidence:
+				pressed = self._getPressedDigitizerButtons(reportBuf, reportLen, linkCollection)
+				if pressed is not None:
+					if hasTip:
+						tip = USAGE_TIP_SWITCH in pressed
+					if hasConfidence:
+						confident = USAGE_CONFIDENCE in pressed
+			slots.append(
+				(
+					contactId,
+					min(1.0, max(0.0, xProportion)),
+					min(1.0, max(0.0, yProportion)),
+					tip,
+					confident,
+				),
+			)
+		return contactCount, scanTime, slots
+
+
+class _FrameAssembler:
+	"""Turns one device's stream of decoded reports into complete frames (the
+	slots that are live in one scan), handling hybrid reporting mode: a
+	device whose reports have fewer contact slots than contacts it's
+	tracking sends one frame as several reports - the first carrying the
+	real Contact Count, each following one Contact Count 0 and the same Scan
+	Time - and only their slots concatenated are the real frame.
+
+	A device that always fits a frame in one report (parallel mode, e.g. the
+	development hardware: 5 slots, at most 5 contacts) takes the
+	contactCount > 0 branch every time and gets back exactly the first
+	contactCount slots, identical to how liveness was decided before this
+	class existed. A Contact Count 0 report that isn't continuing an
+	incomplete frame is a genuine empty frame (every finger lifted), also as
+	before.
+	"""
+
+	def __init__(self):
+		self._pending = None  # (expectedCount, scanTime, collectedSlots)
+
+	def feed(self, contactCount, scanTime, slots):
+		"""Returns the complete frame's slots (possibly empty), or None if
+		this report only started/continued a frame that isn't complete yet.
+		"""
+		if contactCount > 0:
+			if contactCount <= len(slots):
+				self._pending = None
+				return slots[:contactCount]
+			self._pending = (contactCount, scanTime, list(slots))
+			return None
+		if self._pending is not None:
+			expected, pendingScanTime, collected = self._pending
+			self._pending = None
+			if scanTime is None or pendingScanTime is None or scanTime == pendingScanTime:
+				collected = collected + list(slots[: expected - len(collected)])
+				if len(collected) >= expected:
+					return collected
+				self._pending = (expected, pendingScanTime, collected)
+				return None
+			# A new scan started before the previous frame completed - the rest
+			# of that frame was lost; this report is a genuine empty frame.
+		return []
 
 
 def _getDeviceName(hDevice):
@@ -581,7 +828,64 @@ def _buildParser(hDevice):
 		log.debugWarning(f"touchExplore: HidP_GetValueCaps failed for device {hDevice}")
 		return None
 
-	return _DeviceParser(preparsedBuf, list(valueCapsArray)[: valueCapsCount.value], caps.InputReportByteLength)
+	buttonCaps = []
+	if caps.NumberInputButtonCaps:
+		buttonCapsCount = USHORT(caps.NumberInputButtonCaps)
+		buttonCapsArray = (HIDP_BUTTON_CAPS * buttonCapsCount.value)()
+		bcStatus = hidDll.HidP_GetButtonCaps(HidP_Input, buttonCapsArray, byref(buttonCapsCount), preparsedPtr)
+		if bcStatus == HIDP_STATUS_SUCCESS:
+			buttonCaps = list(buttonCapsArray)[: buttonCapsCount.value]
+		else:
+			# Not fatal: without button caps, Tip/Confidence are simply treated
+			# as absent and liveness falls back to Contact Count alone.
+			log.debugWarning(f"touchExplore: HidP_GetButtonCaps failed for device {hDevice}")
+
+	parser = _DeviceParser(
+		preparsedBuf,
+		list(valueCapsArray)[: valueCapsCount.value],
+		buttonCaps,
+		caps.InputReportByteLength,
+	)
+	if not parser.slotLinkCollections:
+		log.debugWarning(f"touchExplore: device {hDevice} has no contact slots with Contact ID/X/Y")
+		return None
+	log.debug(f"touchExplore: parser for device {hDevice}: {parser.describe()}")
+	return parser
+
+
+def _chooseMapRect():
+	"""The screen rectangle the touchpad surface should map onto for a new
+	gesture: the monitor holding the foreground window, so a user whose
+	active app is on a second monitor can actually reach it (previously the
+	pad always mapped onto the primary monitor only).
+
+	Falls back to the primary monitor when NVDA's own edge gestures
+	(config.conf["touch"]["edgeGestures"]) are on: touchHandler._getEdge()
+	tests coordinates against the PRIMARY screen's size only, so on a monitor
+	to the right of the primary one every x would read as "right edge" and
+	every gesture would get a spurious edge prefix, matching no binding.
+	"""
+	try:
+		if config.conf["touch"]["edgeGestures"]:
+			return monitors.primaryRect()
+	except KeyError:
+		pass  # NVDA version without edge gestures - nothing to protect.
+	return monitors.foregroundRect()
+
+
+# NVDA versions with sequential-flick gestures ("flickrightthenleft" etc)
+# build them in TouchHandler._processGestures(), not inside TrackerManager -
+# so a pump() that only drains emitTrackers() itself (as this module's
+# originally did, copying the older TouchHandler.pump()) silently never
+# produces them. When the running NVDA has that machinery, pump() calls it
+# directly with this object as self; it only touches self.trackerManager,
+# self._curTouchMode, self._executeGesture and self._tryBuildSequentialGesture,
+# all of which TrackpadTouchScreen provides (the last borrowed from
+# TouchHandler itself).
+_canUseNvdaProcessGestures = hasattr(touchHandler.TouchHandler, "_processGestures") and hasattr(
+	touchHandler.TouchHandler,
+	"_tryBuildSequentialGesture",
+)
 
 
 class TrackpadTouchScreen:
@@ -610,11 +914,14 @@ class TrackpadTouchScreen:
 	x/y fed to the tracker manager are real screen pixel coordinates,
 	computed by scaling each contact's proportional position on the
 	touchpad surface (0.0-1.0 per axis, from the device's own logical
-	min/max) onto the primary screen's pixel dimensions - the trackpad
-	surface maps onto the whole screen the same way a real touchscreen's
-	surface does, independent of and ignoring wherever the OS mouse cursor
-	happens to be.
+	min/max) onto one monitor's pixel rectangle (see _chooseMapRect) - the
+	trackpad surface maps onto that whole monitor the same way a real
+	touchscreen's surface does, independent of and ignoring wherever the OS
+	mouse cursor happens to be.
 	"""
+
+	if _canUseNvdaProcessGestures:
+		_tryBuildSequentialGesture = touchHandler.TouchHandler._tryBuildSequentialGesture
 
 	def __init__(self, mode="object"):
 		# Constructing gui.NonReEntrantTimer (a wx.Timer subclass) requires
@@ -628,8 +935,35 @@ class TrackpadTouchScreen:
 		self._mouseLegacySuppressed = False
 		self._wndProcRef = None
 		self._parsersByDevice = {}
+		self._frameAssemblers = {}
+		# Contacts are keyed by (hDevice, contactId) throughout, not the bare
+		# HID contact ID: two touchpads (e.g. built-in + external) each number
+		# their contacts from their own small range, and would otherwise
+		# collide inside the one TrackerManager both feed. Each live key gets
+		# a fresh integer tracker ID (TrackerManager's own ID type).
+		self._trackerIds = {}
+		self._nextTrackerId = itertools.count(1)
+		# (hDevice, contactId) keys the device has flagged as not confident
+		# (palm/unintentional per the spec). Ignored until that contact ID
+		# stops being reported at all, since the spec says confidence, once
+		# cleared, stays cleared for the rest of that contact's lifetime.
+		self._rejectedKeys = set()
+		# Last reported screen position of each live (hDevice, contactId).
 		self._lastContactPositions = {}
-		self._lastContactIds = set()
+		# Smoothed interval between real reports, per device - see
+		# LIFT_INFERENCE_REPORT_INTERVALS.
+		self._reportIntervals = {}
+		self._lastDeviceReportTime = {}
+		# Screen rectangle (left, top, width, height) the touchpad surface is
+		# currently mapped onto - chosen when the first finger of a gesture
+		# lands, then held fixed until every finger has lifted, so a gesture
+		# can't jump monitors midway if focus changes during it.
+		self._mapRect = None
+		# Used when a report arrives with RAWINPUTHEADER.hDevice == 0, which
+		# Microsoft documents as possible for precision touchpad input: only
+		# attributable if exactly one touchpad is present.
+		self._soleDevice = None
+		self._useNvdaProcessGestures = _canUseNvdaProcessGestures
 		# Per-contact timestamp (time.time()) of its last REAL HID report -
 		# distinct from the timer-poll re-feeds in _handlePollTimer(), which
 		# intentionally do not update this. Used to infer a lift when the
@@ -750,11 +1084,15 @@ class TrackpadTouchScreen:
 
 			deviceHandles = findTouchpadDevices()
 			if not deviceHandles:
-				raise RuntimeError("No Precision Touchpad HID digitizer device found")
+				raise NoTouchpadFoundError("No Precision Touchpad HID digitizer device found")
+			self._soleDevice = deviceHandles[0] if len(deviceHandles) == 1 else None
 			ridArray = (RAWINPUTDEVICE * 2)()
 			ridArray[0].usUsagePage = USAGE_PAGE_DIGITIZER
 			ridArray[0].usUsage = USAGE_TOUCHPAD
-			ridArray[0].dwFlags = RIDEV_INPUTSINK
+			# RIDEV_DEVNOTIFY: WM_INPUT_DEVICE_CHANGE on touchpad arrival/removal
+			# (e.g. an external touchpad plugged in or unpaired while this
+			# mode is on) - see _handleDeviceChange.
+			ridArray[0].dwFlags = RIDEV_INPUTSINK | RIDEV_DEVNOTIFY
 			ridArray[0].hwndTarget = self._hwnd
 			# The trackpad is, physically, also an ordinary mouse-class HID
 			# device generating real WM_MOUSEMOVE/click messages in parallel
@@ -847,9 +1185,53 @@ class TrackpadTouchScreen:
 		if msg == WM_TIMER:
 			self._handlePollTimer()
 			return 0
+		if msg == WM_INPUT_DEVICE_CHANGE:
+			self._handleDeviceChange(wParam, lParam)
+			return 0
 		return user32.DefWindowProcW(hwnd, msg, wParam, lParam)
 
-	def _handlePollTimer(self):
+	def _handleDeviceChange(self, change, hDevice):
+		"""A touchpad was attached or removed while this mode is on. Raw input
+		handles aren't stable across device re-enumeration (see CLAUDE.md), so
+		drop anything cached for the handle - including a cached None, in
+		case a handle value gets reused for a different device - and lift any
+		contacts a removed device still had down, rather than leaving them
+		stuck until lift inference catches them.
+		"""
+		self._parsersByDevice.pop(hDevice, None)
+		self._frameAssemblers.pop(hDevice, None)
+		if change == GIDC_REMOVAL:
+			for key in [key for key in self._lastContactPositions if key[0] == hDevice]:
+				self._liftContact(key)
+			self._rejectedKeys = {key for key in self._rejectedKeys if key[0] != hDevice}
+			self._reportIntervals.pop(hDevice, None)
+			self._lastDeviceReportTime.pop(hDevice, None)
+			core.requestPump()
+		devices = findTouchpadDevices()
+		self._soleDevice = devices[0] if len(devices) == 1 else None
+		log.debug(f"touchExplore: touchpad device change {change} for {hDevice}, {len(devices)} now present")
+
+	def _trackerIdFor(self, key):
+		trackerId = self._trackerIds.get(key)
+		if trackerId is None:
+			trackerId = self._trackerIds[key] = next(self._nextTrackerId)
+		return trackerId
+
+	def _liftContact(self, key):
+		"""Tells trackerManager the contact for key has lifted, at its last
+		known position, and forgets it.
+		"""
+		x, y = self._lastContactPositions.pop(key)
+		self._lastRealReportTime.pop(key, None)
+		self.trackerManager.update(self._trackerIds.pop(key), x, y, True)
+
+	def _liftInferenceTimeout(self, hDevice):
+		return max(
+			LIFT_INFERENCE_TIMEOUT_S,
+			LIFT_INFERENCE_REPORT_INTERVALS * self._reportIntervals.get(hDevice, 0.0),
+		)
+
+	def _handlePollTimer(self, now=None):
 		"""Re-feeds every currently-down contact's LAST KNOWN position into
 		trackerManager on a short fixed interval, independent of whether a
 		new HID report has actually arrived. Needed because this hardware's
@@ -863,35 +1245,34 @@ class TrackpadTouchScreen:
 		to prompt re-evaluation in time.
 
 		Also infers a lift for any contact whose last REAL report (not a
-		previous poll re-feed - see _lastRealReportTime) is older than
-		LIFT_INFERENCE_TIMEOUT_S. Necessary because this hardware, confirmed
-		directly, sends no report at all for an ACTUAL LIFT following a fast
-		flick, not just for a stationary contact - without this, a lifted
-		contact would be kept alive by this same poll forever (this method
-		would otherwise re-feed its last position with complete=False
-		indefinitely, permanently preventing the complete=True call that
-		touchTracker.SingleTouchTracker requires to ever classify a tap or
-		flick at all). See CLAUDE.md for the full investigation.
+		previous poll re-feed - see _lastRealReportTime) is older than its
+		device's lift-inference timeout (_liftInferenceTimeout). Necessary
+		because this hardware, confirmed directly, sends no report at all for
+		an ACTUAL LIFT following a fast flick, not just for a stationary
+		contact - without this, a lifted contact would be kept alive by this
+		same poll forever (this method would otherwise re-feed its last
+		position with complete=False indefinitely, permanently preventing the
+		complete=True call that touchTracker.SingleTouchTracker requires to
+		ever classify a tap or flick at all). See CLAUDE.md for the full
+		investigation.
 		"""
 		if not self._lastContactPositions:
 			return
-		now = time.time()
-		staleIds = [
-			contactId
-			for contactId, lastReal in self._lastRealReportTime.items()
-			if now - lastReal >= LIFT_INFERENCE_TIMEOUT_S
+		if now is None:
+			now = time.time()
+		staleKeys = [
+			key
+			for key, lastReal in self._lastRealReportTime.items()
+			if now - lastReal >= self._liftInferenceTimeout(key[0])
 		]
-		for contactId in staleIds:
-			x, y = self._lastContactPositions.pop(contactId)
-			self._lastRealReportTime.pop(contactId, None)
-			self._lastContactIds.discard(contactId)
+		for key in staleKeys:
 			log.debug(
-				f"touchExplore: inferred lift for contact {contactId} "
-				f"(no real report for >={LIFT_INFERENCE_TIMEOUT_S}s)",
+				f"touchExplore: inferred lift for contact {key} "
+				f"(no real report for >={self._liftInferenceTimeout(key[0]):.3f}s)",
 			)
-			self.trackerManager.update(contactId, x, y, True)
-		for contactId, (x, y) in self._lastContactPositions.items():
-			self.trackerManager.update(contactId, x, y, False)
+			self._liftContact(key)
+		for key, (x, y) in self._lastContactPositions.items():
+			self.trackerManager.update(self._trackerIds[key], x, y, False)
 		core.requestPump()
 
 	def _handleRawInput(self, lParam):
@@ -910,40 +1291,45 @@ class TrackpadTouchScreen:
 			log.debug(f"touchExplore: WM_INPUT non-HID dwType={header.dwType}")
 			return
 
-		parser = self._parsersByDevice.get(header.hDevice, "__unset__")
+		hDevice = header.hDevice
+		if not hDevice:
+			# Documented as possible for precision touchpad input. Only
+			# attributable when exactly one touchpad is present.
+			if self._soleDevice is None:
+				log.debug("touchExplore: WM_INPUT with hDevice=0 and not exactly one touchpad; ignored")
+				return
+			hDevice = self._soleDevice
+
+		parser = self._parsersByDevice.get(hDevice, "__unset__")
 		if parser == "__unset__":
-			parser = _buildParser(header.hDevice)
-			self._parsersByDevice[header.hDevice] = parser  # cache failures (None) too - don't retry every report
+			parser = _buildParser(hDevice)
+			self._parsersByDevice[hDevice] = parser  # cache failures (None) too - don't retry every report
 		if parser is None:
-			log.debug(f"touchExplore: no parser for device {header.hDevice}")
+			log.debug(f"touchExplore: no parser for device {hDevice}")
 			return
 
 		hidOffset = sizeof(RAWINPUTHEADER)
 		dwSizeHid = int.from_bytes(buf.raw[hidOffset : hidOffset + 4], "little")
+		dwCount = int.from_bytes(buf.raw[hidOffset + 4 : hidOffset + 8], "little")
 		rawStart = hidOffset + 8
-		reportBytes = buf.raw[rawStart : rawStart + dwSizeHid]
-		if len(reportBytes) < parser.reportByteLength:
-			log.debug(f"touchExplore: report too short len={len(reportBytes)} expected={parser.reportByteLength}")
-			return
-
-		contacts = parser.decodeContacts(reportBytes)
-		screenWidth = user32.GetSystemMetrics(SM_CXSCREEN)
-		screenHeight = user32.GetSystemMetrics(SM_CYSCREEN)
-
-		currentIds = set(contacts.keys())
-		for contactId in self._lastContactIds - currentIds:
-			lastPos = self._lastContactPositions.pop(contactId, None)
-			self._lastRealReportTime.pop(contactId, None)
-			if lastPos is not None:
-				self.trackerManager.update(contactId, lastPos[0], lastPos[1], True)
-		now = time.time()
-		for contactId, (xProportion, yProportion) in contacts.items():
-			x = max(0, min(screenWidth - 1, int(xProportion * screenWidth)))
-			y = max(0, min(screenHeight - 1, int(yProportion * screenHeight)))
-			self._lastContactPositions[contactId] = (x, y)
-			self._lastRealReportTime[contactId] = now
-			self.trackerManager.update(contactId, x, y, False)
-		self._lastContactIds = currentIds
+		# RAWHID can batch several same-sized reports into one WM_INPUT
+		# (dwCount > 1) - each is a separate report and, in hybrid mode,
+		# possibly a separate piece of the same frame.
+		for index in range(max(1, dwCount)):
+			reportBytes = buf.raw[rawStart + index * dwSizeHid : rawStart + (index + 1) * dwSizeHid]
+			if len(reportBytes) < parser.reportByteLength:
+				log.debug(f"touchExplore: report too short len={len(reportBytes)} expected={parser.reportByteLength}")
+				return
+			decoded = parser.decode(reportBytes)
+			if decoded is None:
+				log.debug(f"touchExplore: ignoring non-contact report from device {hDevice}")
+				continue
+			assembler = self._frameAssemblers.get(hDevice)
+			if assembler is None:
+				assembler = self._frameAssemblers[hDevice] = _FrameAssembler()
+			frame = assembler.feed(*decoded)
+			if frame is not None:
+				self._applyFrame(hDevice, frame, time.time())
 
 		# Only update trackerManager and request a pump here - this method
 		# runs on the background HID capture thread, and actually dispatching
@@ -958,18 +1344,86 @@ class TrackpadTouchScreen:
 		# must not be called redundantly from here.
 		core.requestPump()
 
-	def pump(self):
-		"""Called by core.py's CorePump.Notify() on the main thread, exactly
-		as it calls touchHandler.TouchHandler.pump() for real touch hardware
-		- required to exist here since this object IS touchHandler.handler
-		while trackpad-as-touchscreen mode is active (see start()). Its
-		absence previously caused an AttributeError on every single core
-		pump cycle once installed as touchHandler.handler, which - since
-		core.py's CorePump.Notify() catches and logs but does not re-raise
-		that exception - silently aborted every later step in that pump
-		cycle (including queueHandler.pumpAll(), which drains NVDA's speech
-		queue), breaking NVDA's own speech and forcing a restart to recover.
-		See CLAUDE.md.
+	def _applyFrame(self, hDevice, slots, now):
+		"""Applies one complete frame (see _FrameAssembler) from hDevice:
+		lifts contacts that are no longer live, updates/creates the rest.
+
+		A slot is live unless its Tip Switch is clear (the spec's explicit
+		lift report: the contact is sent once more with tip clear at its last
+		position) or its Confidence is clear (palm/unintentional contact).
+		Either usage only counts when the device declares it (tip/confident
+		None otherwise), so a device without them - or one where reading them
+		failed - is judged on Contact Count alone, as before.
+		"""
+		live = {}
+		reportedKeys = set()
+		for slot in slots:
+			if slot is None:
+				continue
+			contactId, xProportion, yProportion, tip, confident = slot
+			key = (hDevice, contactId)
+			reportedKeys.add(key)
+			if confident is False and key not in self._rejectedKeys:
+				self._rejectedKeys.add(key)
+				log.debug(f"touchExplore: contact {key} flagged not confident (palm?); ignoring it")
+			if key in self._rejectedKeys or tip is False:
+				continue
+			live[key] = (xProportion, yProportion)
+		# A rejected contact ID that's no longer reported at all has gone;
+		# the device may reuse the ID for a new, genuine contact.
+		self._rejectedKeys = {key for key in self._rejectedKeys if key[0] != hDevice or key in reportedKeys}
+
+		for key in [key for key in self._lastContactPositions if key[0] == hDevice and key not in live]:
+			self._liftContact(key)
+
+		lastReport = self._lastDeviceReportTime.get(hDevice)
+		if live and lastReport is not None and 0 < now - lastReport <= MAX_REPORT_INTERVAL_SAMPLE_S:
+			previous = self._reportIntervals.get(hDevice)
+			interval = now - lastReport
+			self._reportIntervals[hDevice] = interval if previous is None else 0.8 * previous + 0.2 * interval
+		self._lastDeviceReportTime[hDevice] = now
+
+		if live and (self._mapRect is None or not self._lastContactPositions):
+			self._mapRect = _chooseMapRect()
+			self._applyThresholds(hDevice)
+		for key, (xProportion, yProportion) in live.items():
+			left, top, width, height = self._mapRect
+			x = left + max(0, min(width - 1, int(xProportion * width)))
+			y = top + max(0, min(height - 1, int(yProportion * height)))
+			self._lastContactPositions[key] = (x, y)
+			self._lastRealReportTime[key] = now
+			self.trackerManager.update(self._trackerIdFor(key), x, y, False)
+
+	def _applyThresholds(self, hDevice):
+		"""Converts the trackpad's millimetre thresholds (touchSettings) to
+		pixels for this gesture: how many screen pixels one millimetre of pad
+		covers depends on both the pad's physical size and the monitor it's
+		currently mapped onto, so it's recomputed whenever the mapping is
+		chosen. The two axes can scale differently (pad and monitor aspect
+		ratios needn't match) while touchTracker has one threshold for both,
+		so their average is used.
+		"""
+		parser = self._parsersByDevice.get(hDevice)
+		sizeMM = getattr(parser, "sizeMM", None)
+		if not sizeMM:
+			sizeMM = FALLBACK_PAD_SIZE_MM
+			log.debug(f"touchExplore: device {hDevice} has no physical size; assuming {sizeMM}mm")
+		_left, _top, width, height = self._mapRect
+		touchSettings.apply(touchSettings.TRACKPAD, (width / sizeMM[0] + height / sizeMM[1]) / 2)
+
+	def _executeGesture(self, gesture):
+		"""Same contract as touchHandler.TouchHandler._executeGesture, which
+		NVDA's own _processGestures() calls on self (see pump()).
+		"""
+		try:
+			inputCore.manager.executeGesture(gesture)
+		except inputCore.NoInputGestureAction:
+			pass
+
+	def _processGesturesLegacy(self):
+		"""Emits pending trackers one-to-one as gestures, for NVDA versions
+		without TouchHandler._processGestures() (so without sequential-flick
+		gestures either); mirrors the older TouchHandler.pump() loop.
 		"""
 		for preheldTracker, tracker in self.trackerManager.emitTrackers():
 			log.debug(
@@ -991,11 +1445,37 @@ class TrackpadTouchScreen:
 			# directly the way real TouchHandler's own browse-mode-tracking
 			# code does.
 			modeValue = getattr(self._curTouchMode, "value", self._curTouchMode)
-			gesture = touchHandler.TouchInputGesture(preheldTracker, tracker, modeValue)
+			self._executeGesture(touchHandler.TouchInputGesture(preheldTracker, tracker, modeValue))
+
+	def pump(self):
+		"""Called by core.py's CorePump.Notify() on the main thread, exactly
+		as it calls touchHandler.TouchHandler.pump() for real touch hardware
+		- required to exist here since this object IS touchHandler.handler
+		while trackpad-as-touchscreen mode is active (see start()). Its
+		absence previously caused an AttributeError on every single core
+		pump cycle once installed as touchHandler.handler, which - since
+		core.py's CorePump.Notify() catches and logs but does not re-raise
+		that exception - silently aborted every later step in that pump
+		cycle (including queueHandler.pumpAll(), which drains NVDA's speech
+		queue), breaking NVDA's own speech and forcing a restart to recover.
+		See CLAUDE.md.
+
+		Prefers NVDA's own TouchHandler._processGestures() when the running
+		version has it (see _canUseNvdaProcessGestures), so trackpad input
+		gets exactly the same gesture processing - sequential flicks
+		included - as a real touchscreen. If that ever fails against a future
+		NVDA whose method needs something this class doesn't provide, fall
+		back to the legacy loop for the rest of the session rather than
+		breaking every pump (the failure mode described above).
+		"""
+		if self._useNvdaProcessGestures:
 			try:
-				inputCore.manager.executeGesture(gesture)
-			except inputCore.NoInputGestureAction:
-				pass
+				touchHandler.TouchHandler._processGestures(self)
+			except Exception:
+				log.exception("touchExplore: NVDA's _processGestures failed; using legacy gesture loop")
+				self._useNvdaProcessGestures = False
+		else:
+			self._processGesturesLegacy()
 		interval = self.trackerManager.pendingEmitInterval
 		if interval and interval > 0:
 			# Ensure we are pumped again by the time more pending multiTouch trackers are ready.

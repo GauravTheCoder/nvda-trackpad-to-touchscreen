@@ -2,12 +2,19 @@
 
 Improves NVDA's touch explore-by-touch feedback:
 
-- Plays a short "explore" sound when your finger lands on a real, actionable
+- Plays a short sound (earcon) when your finger lands on a real, actionable
   item (icon, list item, button, link, cell, etc), in addition to NVDA's
-  normal spoken announcement of that item.
-- Plays a "click" sound (no extra speech) whenever you activate an item -
+  normal spoken announcement of that item - a different one for buttons,
+  links, edit fields and check boxes. The sound is also placed where the
+  item is on screen: panned left or right, and higher or lower in pitch the
+  higher or lower on the screen it is. Flicking to an item plays its sound too. See "Sounds"
+  below.
+- Plays an activation sound (no extra speech) whenever you activate an item -
   split-tap (see below) or a same-spot double-tap - confirming the action
   happened without adding to what NVDA already says.
+- Adds touch gestures for stopping speech, turning speech off and on,
+  scrolling, media play/pause and speech rate. See "Extra touch gestures"
+  below.
 - Stays completely silent (no speech, no tone) whenever the touch hit
   resolves to a generic container (pane, list, window, tree, panel, etc)
   rather than a real item — whether that's because the finger is over
@@ -34,7 +41,7 @@ Improves NVDA's touch explore-by-touch feedback:
   actually used (e.g. a 3-finger tap registering as a 1- or 2-finger tap).
 - Adds a trackpad-as-touchscreen mode (**NVDA+Ctrl+Shift+T** to toggle): on a
   laptop with no touchscreen, reads your trackpad's own multi-touch surface
-  directly and maps it onto the whole screen, so every touch gesture above -
+  directly and maps it onto the whole monitor you're working on, so every touch gesture above -
   plus NVDA's own built-in touch gestures (explore, tap, flick, multi-finger
   taps, mode-cycling, etc) - work from the trackpad exactly as they would on
   real touchscreen hardware. While this mode is on, the add-on also turns off
@@ -43,6 +50,104 @@ Improves NVDA's touch explore-by-touch feedback:
   from the same fingers, and restores your original trackpad settings when
   you turn the mode back off. See "Trackpad-as-touchscreen mode" below for
   requirements and limitations.
+- Lets you adjust how touch gestures are recognised, measured in
+  millimetres so they feel the same on any screen or trackpad, and includes
+  a calibration that measures your own taps and flicks. See "Touch settings
+  and calibration" below.
+
+## Sounds
+
+Sounds are set in NVDA Settings > **Touch Explore** > Sounds:
+
+- **Play sounds**: turn all of this add-on's sounds on or off.
+- **Different sounds for buttons, links, edit fields and check boxes**: when
+  off, every item uses the same sound.
+- **Sound when your finger moves off an item into empty space**: a faint
+  tick, played once as your finger leaves an item for empty space (such as
+  the gap between desktop icons), so you can tell empty space from "still on
+  the same item". Inside lists it can also tick briefly between rows.
+- **Play sounds left or right by where they are on the screen**.
+- **Play sounds higher or lower by how high up the screen they are**: at the
+  top edge a sound plays 6 semitones (half an octave) higher, at the
+  bottom edge 6 lower, and in the middle unchanged. Together with the left/
+  right setting, you can hear roughly where on the screen an item is.
+- **Sound pack**: "Earcons" (default) or "Classic" (this add-on's original
+  explore and click sounds, shortened).
+- **Preview sounds** plays the item, button, link, edit field, check box and
+  activation sounds of the selected pack, moving from the top left of the
+  screen to the bottom right (so you hear the panning and pitch settings if
+  they're ticked).
+
+Other sounds: a low "bong" when a flick reaches the first or last item ("No
+next"/"No previous"); a sound for scrolling; rising/falling sounds when
+speech or trackpad touchscreen mode is turned on or off. Sounds follow
+NVDA's own sound volume setting.
+
+The Earcons pack is made from Kenney's "Interface Sounds"
+(https://kenney.nl/assets/interface-sounds), released as CC0 (public
+domain), so the add-on can include and redistribute them. To hear all the
+sounds with their names spoken, followed by demonstrations of the height
+(pitch) and left/right placement, play `resources/sounds/earcon-audition.wav`
+(not included in the add-on package). `resources/sounds/build_sounds.py`
+rebuilds the packs from the original downloads.
+
+## Extra touch gestures
+
+| Gesture | Action |
+|---|---|
+| Two-finger tap | Stop speech |
+| Three-finger double tap | Turn speech off, or back on |
+| Three-finger flick up / down | Page Down / Page Up (like VoiceOver: flicking up shows what's further down) |
+| Two-finger triple tap | Media play/pause |
+| Pinch out / in | Faster / slower speech (5 steps each) |
+
+All of these can be changed in NVDA's Input Gestures dialog, under Touch
+Explore Sounds. That category also lists two commands with no gesture by
+default:
+
+- **Touch calibration** (see below).
+- **Copy touch diagnostics to the clipboard**: details of your touch
+  hardware and settings, to paste into a bug report.
+
+In trackpad touchscreen mode, Windows may take three-finger gestures for
+itself; see "Notes / limitations".
+
+## Touch settings and calibration
+
+NVDA Settings > **Touch Explore** has separate settings for the touchscreen
+and the trackpad:
+
+- **Tap movement tolerance (mm)**: how far a finger may move and still count
+  as a tap. Raise it if taps (especially two- and three-finger taps) are
+  missed or come out as the wrong number of fingers.
+- **Minimum flick distance (mm)**: how far a finger must travel for a flick.
+  Lower it if short flicks are ignored. It must be at least 1.5 times the
+  tap tolerance.
+- **Minimum pinch distance (mm)**: how much two fingers must spread or close
+  for a pinch.
+- **Gesture time (ms)**: the longest a tap or flick may take, and also how
+  quickly the second tap of a double tap must start. Raise it if your
+  gestures are slow or double taps come out as two single taps. A single
+  tap waits this long before it acts, so lower values make single taps
+  respond faster.
+
+The defaults match this add-on's earlier fixed behaviour.
+
+**Calibrate touch** (a button in the same panel; the command can also be
+assigned a gesture in Input Gestures, under Touch Explore Sounds) measures
+how you actually touch, then offers new settings:
+
+1. It calibrates whichever touch input is active: the touchscreen, or the
+   trackpad if trackpad touchscreen mode is on.
+2. It speaks each step: 8 single taps, 5 two-finger taps, 5 double taps and
+   8 flicks, done the way you normally would. A high beep and a count mean
+   the gesture was counted; a low beep and "Try again" mean it didn't match
+   the step. You can skip any step; the settings that step would have
+   measured stay as they are.
+3. During these steps, touch gestures don't do anything, so tapping can't
+   activate anything by accident. Press Escape to cancel at any time.
+4. At the end it reads out the old and new values. Press Save (focused, so
+   Enter works) to use them, or Cancel to keep your old settings.
 
 ## System requirements
 
@@ -105,6 +210,19 @@ same way dragging a finger on a real touchscreen would (proportionally - the
 top-left of your trackpad maps to the top-left of your screen, and so on),
 and all touch gestures (tap, flick, hold, multi-finger taps, this add-on's
 split-tap activation, etc) work from it.
+
+With more than one monitor, the trackpad maps onto whichever monitor holds
+the window you're currently working in, chosen each time a new gesture
+starts (it doesn't switch monitors mid-gesture). Exception: if NVDA's own
+"edge gestures" touch setting is on (NVDA versions that have it), the
+trackpad always maps onto the primary monitor, because NVDA only detects
+edges on the primary monitor.
+
+Palm touches that the trackpad itself flags as accidental are ignored. If
+more than one Precision Touchpad is connected (e.g. built-in plus external),
+both work, and one can be plugged in or removed while this mode is on. If
+your trackpad isn't a Precision Touchpad, NVDA says "No Precision Touchpad
+found" when you try to turn this mode on.
 
 Requirements:
 
