@@ -44,6 +44,19 @@ Improves NVDA's touch explore-by-touch feedback:
   you turn the mode back off. See "Trackpad-as-touchscreen mode" below for
   requirements and limitations.
 
+## System requirements
+
+- NVDA 2023.1 or later (see `minimumNVDAVersion` in
+  `touchExplore/manifest.ini`), which in turn means any Windows version NVDA
+  2023.1 itself supports (Windows 8.1 or later) for the core add-on - the
+  container/role/selection fixes, split-tap, and the real-touchscreen
+  multi-finger fix all use only standard, version-independent MSAA/UIA/touch
+  APIs.
+- Trackpad-as-touchscreen mode's raw-input HID digitizer reading works on
+  any Windows version with a Precision Touchpad, but its OS-gesture
+  minimization step specifically requires Windows 11 24H2 (build 26100+) -
+  see "Trackpad-as-touchscreen mode" below.
+
 ## Why this happens in stock NVDA
 
 NVDA's touch explore logic (`screenExplorer.ScreenExplorer.moveTo`) hit-tests
