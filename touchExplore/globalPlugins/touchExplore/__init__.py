@@ -27,25 +27,49 @@
 # support is toggled or a config profile switch occurs), so rather than
 # patching one instance, we patch the moveTo method on the class itself.
 
+import os
+
 import api
 import config
 import controlTypes
 import globalPluginHandler
 import locationHelper
+import nvwave
 import screenExplorer
 import speech
 import textInfos
-import tones
 import touchHandler
 import touchTracker
 import ui
 from comtypes import COMError
 from logHandler import log
+from NVDAObjects import NVDAObject
 from scriptHandler import script
 from utils.security import objectBelowLockScreenAndWindowsIsLocked
 
 from . import touchpadOsSettings
 from .trackpadTouch import TrackpadTouchScreen
+
+_SOUNDS_DIR = os.path.join(os.path.dirname(__file__), "sounds")
+EXPLORE_SOUND_PATH = os.path.join(_SOUNDS_DIR, "explore.wav")
+CLICK_SOUND_PATH = os.path.join(_SOUNDS_DIR, "click.wav")
+
+
+def _playSound(path: str) -> None:
+	"""Plays a bundled UI sound asynchronously, matching how NVDA plays its
+	own built-in sounds (waves/*.wav via nvwave.playWaveFile). Sounds are
+	WAV, not the MP3 they were originally supplied as - nvwave.playWaveFile
+	uses the stdlib wave module internally (wave.open(fileName, "r")),
+	which only reads WAV; there is no MP3 decoding anywhere in NVDA itself,
+	and this add-on has no external dependencies to add one. Converted once
+	with ffmpeg to 22050 Hz mono 16-bit PCM, matching NVDA's own waves/*.wav
+	files exactly (confirmed by inspecting one, e.g. waves/browseMode.wav)
+	rather than guessing a format nvwave would accept.
+	"""
+	try:
+		nvwave.playWaveFile(path)
+	except Exception:
+		log.debugWarning(f"touchExplore: failed to play sound {path!r}", exc_info=True)
 
 # Roles that are "generic containers": their own announcement (name, role,
 # row/column counts) is a waypoint, not content. This is true whether the
@@ -75,11 +99,6 @@ _CONTAINER_ROLES = frozenset(
 		controlTypes.Role.INTERNALFRAME,
 	},
 )
-
-# Tone played when landing on a new, real item.
-ITEM_TONE_HZ = 1000
-ITEM_TONE_MS = 30
-
 
 # MSAA SELFLAG_TAKEFOCUS | SELFLAG_TAKESELECTION. NVDA's own
 # IAccessible.setFocus() only passes SELFLAG_TAKEFOCUS (1): that moves focus
@@ -148,17 +167,53 @@ def _activateObject(obj, gesture) -> None:
 	review position: obj here is already the exact item _patchedMoveTo
 	tracked under the held finger, so using it directly avoids any
 	dependency on navigator object/review position being in sync at the
-	moment the second finger taps. Deliberately silent, like a regular
-	double-tap.
+	moment the second finger taps. Plays a click sound but otherwise stays
+	silent (no "Activate"/action-name speech), unlike a regular double-tap.
 	"""
 	while obj and not objectBelowLockScreenAndWindowsIsLocked(obj):
 		try:
 			obj.doAction()
+			_playSound(CLICK_SOUND_PATH)
 			if isinstance(gesture, touchHandler.TouchInputGesture):
 				touchHandler.handler.notifyInteraction(obj)
 			return
 		except NotImplementedError:
 			obj = obj.parent
+
+
+def _navigateAndAnnounce(newObj) -> None:
+	"""Sets newObj as the navigator object and announces it, mirroring
+	globalCommands.py's own script_navigatorObject_next/_previous/
+	_nextInFlow/_previousInFlow - except those stock scripts only ever move
+	the navigator/review position, never real OS focus or selection (unlike
+	this add-on's own touch-explore path via _touchSelect), so flicking
+	through a list reports "not selected" on every item regardless of
+	context, the same way keyboard-based object navigation
+	(NVDA+numpad6/4/8/2, etc) always has - it's stock NVDA behavior, not
+	something touch/trackpad-specific.
+
+	This makes flick-based object navigation match touch-explore's own
+	behavior instead: if newObj is focusable, _touchSelect() moves real
+	focus/selection to it (same as touching it directly would), and NVDA's
+	own event hooks announce it correctly (role suppression, accurate
+	selection state) - so we don't call speech.speakObject() ourselves here,
+	same reasoning as _patchedMoveTo (see its comments). If newObj isn't
+	focusable (plain static content, text, etc - not every navigable object
+	is a selectable control), _touchSelect() is a no-op, so we fall back to
+	announcing it exactly like the stock scripts do.
+	"""
+	if not api.setNavigatorObject(newObj):
+		import gui
+
+		ui.reviewMessage(gui.blockAction.Context.WINDOWS_LOCKED.translatedMessage)
+		return
+	statesBefore = newObj.states
+	_touchSelect(newObj)
+	if controlTypes.State.FOCUSABLE not in statesBefore or controlTypes.State.FOCUSED in statesBefore:
+		# _touchSelect() was a no-op (not focusable, or already focused) -
+		# nothing will announce newObj on its own, so do it ourselves,
+		# matching the stock scripts' own fallback behavior.
+		speech.speakObject(newObj, reason=controlTypes.OutputReason.FOCUS)
 
 
 # --- Multi-finger tap misdetection fix --------------------------------
@@ -318,7 +373,7 @@ def _patchedMoveTo(self, x, y, new=False, unit=textInfos.UNIT_LINE):
 	if hasNewObj and objKey is not None and not objectBelowLockScreenAndWindowsIsLocked(obj):
 		speech.cancelSpeech()
 		speechCanceled = True
-		tones.beep(ITEM_TONE_HZ, ITEM_TONE_MS)
+		_playSound(EXPLORE_SOUND_PATH)
 		# Actually move focus and selection to obj (VoiceOver-style
 		# touch-explore) rather than speaking it ourselves. This triggers a
 		# real OS focus/selection change, which NVDA's own event hooks pick
@@ -460,3 +515,222 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		if obj is None:
 			return
 		_activateObject(obj, gesture)
+
+	@script(
+		description=_(
+			# Translators: Input help mode message for activate current
+			# object command (same-spot double-tap).
+			"Performs the default action on the current navigator object "
+			"(example: presses it if it is a button).",
+		),
+		gestures=("ts:double_tap",),
+	)
+	def script_touchExploreDoubleTapActivate(self, gesture):
+		"""Same-spot double-tap activation. Overrides NVDA's own stock
+		globalCommands.script_review_activate for touch input specifically
+		(that gesture, "ts:double_tap", is also bound to kb:NVDA+numpadEnter/
+		kb(laptop):NVDA+enter - those keyboard gestures are untouched in
+		effect, since the click sound and silence below are both gated on
+		isinstance(gesture, touchHandler.TouchInputGesture); a keyboard
+		activation via this same script still calls doAction()/pos.activate()
+		normally, it just doesn't get the touch-only sound). Mirrors
+		_activateObject (this add-on's split-tap activation): plays a click
+		sound on success and stays otherwise silent (no "Activate"/
+		action-name speech) instead of stock's ui.message() announcement -
+		the user found the per-icon "Activate"/"Double Click" wording
+		variance (genuine, per-object MSAA accDefaultAction text, see
+		"Diagnosed and clarified" in CLAUDE.md) more confusing than useful,
+		and asked for just the confirmation sound, matching split-tap.
+		"""
+		pos = api.getReviewPosition()
+		if objectBelowLockScreenAndWindowsIsLocked(pos.obj):
+			import gui
+
+			ui.message(gui.blockAction.Context.WINDOWS_LOCKED.translatedMessage)
+			return
+		isTouch = isinstance(gesture, touchHandler.TouchInputGesture)
+		try:
+			pos.activate()
+			if isTouch:
+				_playSound(CLICK_SOUND_PATH)
+				touchHandler.handler.notifyInteraction(pos.NVDAObjectAtStart)
+			return
+		except NotImplementedError:
+			pass
+		obj = api.getNavigatorObject()
+		while obj and not objectBelowLockScreenAndWindowsIsLocked(obj):
+			try:
+				obj.doAction()
+				if isTouch:
+					_playSound(CLICK_SOUND_PATH)
+					touchHandler.handler.notifyInteraction(obj)
+				return
+			except NotImplementedError:
+				pass
+			obj = obj.parent
+		# Translators: the message reported when there is no action to
+		# perform on the review position or navigator object.
+		ui.message(_("No action"))
+
+	# --- Flick-based object navigation with real focus/selection ----------
+	# NVDA's own stock ts(object):flick*/2finger_flick* scripts (in
+	# globalCommands.py: script_navigatorObject_parent/_firstChild/_next/
+	# _previous/_nextInFlow/_previousInFlow) only ever move the navigator/
+	# review position - unlike this add-on's own touch-explore path
+	# (_patchedMoveTo -> _touchSelect), they never touch real OS focus or
+	# selection. That makes "selected"/"not selected" state speech fire on
+	# every flicked-to item regardless of context, exactly the way it would
+	# via keyboard-based object navigation on stock NVDA - not a bug
+	# introduced by trackpad mode, but inconsistent with how touch-explore
+	# already behaves in this add-on. Binding our own scripts to the same
+	# gesture IDs takes priority over globalCommands's bindings for touch
+	# input specifically (scriptHandler resolves global plugin scripts
+	# before globalCommands.GlobalCommands - the same mechanism this add-on
+	# already relies on for its own split-tap gesture above) while leaving
+	# the keyboard equivalents (NVDA+numpad6, etc) completely untouched, so
+	# only touch/trackpad flicks get the real-selection treatment.
+	# Movement logic mirrors each stock script's exactly (same simpleNext/
+	# simplePrevious/simpleParent/simpleFirstChild/simpleReviewMode
+	# handling), swapping only the final "set navigator object and
+	# announce" step for _navigateAndAnnounce().
+
+	def _getCurrentNavigatorObjectOrReport(self):
+		curObject = api.getNavigatorObject()
+		if not isinstance(curObject, NVDAObject):
+			# Translators: Reported when the user tries to perform a command
+			# related to the navigator object but there is no current
+			# navigator object.
+			ui.reviewMessage(_("No navigator object"))
+			return None
+		return curObject
+
+	@script(
+		description=_(
+			# Translators: Input help mode message for move to parent object command.
+			"Moves the navigator object to the object containing it",
+		),
+		gestures=("ts(object):flickup",),
+	)
+	def script_touchExploreFlickParent(self, gesture):
+		curObject = self._getCurrentNavigatorObjectOrReport()
+		if curObject is None:
+			return
+		simpleReviewMode = config.conf["reviewCursor"]["simpleReviewMode"]
+		newObject = curObject.simpleParent if simpleReviewMode else curObject.parent
+		if newObject is None:
+			# Translators: Reported when there is no containing (parent)
+			# object such as when focused on desktop.
+			ui.reviewMessage(_("No containing object"))
+			return
+		_navigateAndAnnounce(newObject)
+
+	@script(
+		description=_(
+			# Translators: Input help mode message for move to first child object command.
+			"Moves the navigator object to the first object inside it",
+		),
+		gestures=("ts(object):flickdown",),
+	)
+	def script_touchExploreFlickFirstChild(self, gesture):
+		curObject = self._getCurrentNavigatorObjectOrReport()
+		if curObject is None:
+			return
+		simpleReviewMode = config.conf["reviewCursor"]["simpleReviewMode"]
+		newObject = curObject.simpleFirstChild if simpleReviewMode else curObject.firstChild
+		if newObject is None:
+			# Translators: Reported when there is no contained (first
+			# child) object such as inside a document.
+			ui.reviewMessage(_("No objects inside"))
+			return
+		_navigateAndAnnounce(newObject)
+
+	@script(
+		description=_(
+			# Translators: Input help mode message for move to next object command.
+			"Moves the navigator object to the next object",
+		),
+		gestures=("ts(object):2finger_flickright",),
+	)
+	def script_touchExploreFlickNext(self, gesture):
+		curObject = self._getCurrentNavigatorObjectOrReport()
+		if curObject is None:
+			return
+		simpleReviewMode = config.conf["reviewCursor"]["simpleReviewMode"]
+		newObject = curObject.simpleNext if simpleReviewMode else curObject.next
+		if newObject is None:
+			# Translators: Reported when there is no next object (current
+			# object is the last object).
+			ui.reviewMessage(_("No next"))
+			return
+		_navigateAndAnnounce(newObject)
+
+	@script(
+		description=_(
+			# Translators: Input help mode message for move to previous object command.
+			"Moves the navigator object to the previous object",
+		),
+		gestures=("ts(object):2finger_flickleft",),
+	)
+	def script_touchExploreFlickPrevious(self, gesture):
+		curObject = self._getCurrentNavigatorObjectOrReport()
+		if curObject is None:
+			return
+		simpleReviewMode = config.conf["reviewCursor"]["simpleReviewMode"]
+		newObject = curObject.simplePrevious if simpleReviewMode else curObject.previous
+		if newObject is None:
+			# Translators: Reported when there is no previous object
+			# (current object is the first object).
+			ui.reviewMessage(_("No previous"))
+			return
+		_navigateAndAnnounce(newObject)
+
+	@script(
+		description=_(
+			# Translators: Input help mode message for a touchscreen gesture.
+			"Moves to the next object in a flattened view of the object navigation hierarchy",
+		),
+		gestures=("ts(object):flickright",),
+	)
+	def script_touchExploreFlickNextInFlow(self, gesture):
+		curObject = self._getCurrentNavigatorObjectOrReport()
+		if curObject is None:
+			return
+		newObject = None
+		if curObject.simpleFirstChild:
+			newObject = curObject.simpleFirstChild
+		elif curObject.simpleNext:
+			newObject = curObject.simpleNext
+		elif curObject.simpleParent:
+			parent = curObject.simpleParent
+			while parent and not parent.simpleNext:
+				parent = parent.simpleParent
+			if parent:
+				newObject = parent.simpleNext
+		if not newObject:
+			# Translators: a message when there is no next object when navigating
+			ui.reviewMessage(_("No next"))
+			return
+		_navigateAndAnnounce(newObject)
+
+	@script(
+		description=_(
+			# Translators: Input help mode message for a touchscreen gesture.
+			"Moves to the previous object in a flattened view of the object navigation hierarchy",
+		),
+		gestures=("ts(object):flickleft",),
+	)
+	def script_touchExploreFlickPreviousInFlow(self, gesture):
+		curObject = self._getCurrentNavigatorObjectOrReport()
+		if curObject is None:
+			return
+		newObject = curObject.simplePrevious
+		if newObject:
+			while newObject.simpleLastChild:
+				newObject = newObject.simpleLastChild
+		else:
+			newObject = curObject.simpleParent
+		if not newObject:
+			# Translators: a message when there is no previous object when navigating
+			ui.reviewMessage(_("No previous"))
+			return
+		_navigateAndAnnounce(newObject)

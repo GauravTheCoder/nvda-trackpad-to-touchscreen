@@ -2,9 +2,12 @@
 
 Improves NVDA's touch explore-by-touch feedback:
 
-- Plays a short tone (1000 Hz, 30 ms) when your finger lands on a real,
-  actionable item (icon, list item, button, link, cell, etc), in addition to
-  NVDA's normal spoken announcement of that item.
+- Plays a short "explore" sound when your finger lands on a real, actionable
+  item (icon, list item, button, link, cell, etc), in addition to NVDA's
+  normal spoken announcement of that item.
+- Plays a "click" sound (no extra speech) whenever you activate an item -
+  split-tap (see below) or a same-spot double-tap - confirming the action
+  happened without adding to what NVDA already says.
 - Stays completely silent (no speech, no tone) whenever the touch hit
   resolves to a generic container (pane, list, window, tree, panel, etc)
   rather than a real item — whether that's because the finger is over
@@ -18,7 +21,10 @@ Improves NVDA's touch explore-by-touch feedback:
   echo).
 - Moves real focus/selection to whatever item your finger lands on
   (VoiceOver-style), so "selected"/"not selected" speech reflects reality
-  instead of firing on every item regardless of context.
+  instead of firing on every item regardless of context. This also applies
+  when flicking through items (stock NVDA's own flick gestures only move
+  NVDA's review/navigator position, not real focus or selection, which is
+  why "not selected" would otherwise fire on every flicked-to item too).
 - Adds a split-tap activation gesture: hold one finger on a touch-explored
   item, then tap anywhere else on the screen with a second finger to
   activate that item (its default action - e.g. open it), equivalent to
