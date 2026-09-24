@@ -875,6 +875,174 @@ untouched, since gesture identifiers are per-source strings (`kb:...` vs
 `ts:...`/`ts(object):...` share no binding relationship) - only actual
 touch/trackpad flicks get the real-selection treatment.
 
+### Fix: flick navigation no longer steals real focus into a hidden-desktop window
+
+Separate bug report, same underlying cause category as the previous entry
+but a genuinely different mechanism: creating/switching virtual desktops
+(`Ctrl+Win+D`, `Ctrl+Win+←/→`) does not destroy or move windows, it only
+hides them - so an app's window (e.g. WhatsApp) that was the navigator
+object right before a desktop switch stays fully alive in NVDA's
+accessibility tree. A subsequent flick then keeps walking that hidden
+window's object tree via `simpleNext`/`simplePrevious`/`simpleParent`/
+`simpleFirstChild`, and `_navigateAndAnnounce`'s call to `_touchSelect()`
+can move **real OS focus/selection** into that hidden window - not just
+stale narration, an actual focus-steal into an app the user can't see and
+isn't using. This is stock NVDA behavior too (identical with keyboard
+`NVDA+numpad6` etc, no touch involved), since plain UIA/MSAA tree walking
+has no concept of virtual desktops at all - not a regression, but this
+add-on's flick scripts are the ones calling `_touchSelect()`, so they're
+where the guard belongs.
+
+Fixed via a new `virtualDesktop.py` module wrapping the public, documented
+`IVirtualDesktopManager` COM interface (`IsWindowOnCurrentVirtualDesktop`) -
+not to be confused with the various undocumented `IVirtualDesktop`/
+`IVirtualDesktopManagerInternal`/`IApplicationView` shell-private interfaces
+most community virtual-desktop tools use instead. GUIDs
+(`CLSID_VirtualDesktopManager={AA509086-5CA9-4C25-8F95-589D3C07B48A}`,
+`IID_IVirtualDesktopManager={A5CD92FF-29BE-454C-8D04-D82879FB3F1B}`)
+confirmed against three independent, mutually-consistent sources (pyvda's
+`com_defns.py`, `MScholtes/VirtualDesktop.cs`, a community AutoHotkey
+sample) since Microsoft Learn's own pages don't print the raw GUID
+literals. `_navigateAndAnnounce` now checks
+`virtualDesktop.isOnCurrentVirtualDesktop(newObj.windowHandle)` before
+calling `_touchSelect()`; if it's confirmed `False`, falls back to plain
+narration (`speech.speakObject`) instead of moving real focus/selection
+into the hidden window. Fails safe on `None` (COM failure, no virtual
+desktop support, etc) by *not* skipping - worst case reproduces the
+original bug, never wrongly blocks a legitimate same-desktop flick.
+
+**Known limitation, deliberately not chased further: this fix (and
+`IsWindowOnCurrentVirtualDesktop` in general) does not reliably work for
+apps that host their UI in a separate helper-process window** - see the
+next entry for the full investigation. This module was deliberately kept
+in its simple form (`GetAncestor(hwnd, GA_ROOT)` + one COM call, no
+process-tree walking) since flick navigation's `newObj` is always an
+ordinary NVDAObject from a normal single-process app in every case tested
+so far - the MSIX/WebView2-split-process failure mode below was only ever
+observed via touch-explore hitting WhatsApp directly, not via flicking
+onto it. If flick navigation is ever reported to have the same problem,
+see the next entry before re-implementing anything - the fix attempted
+there is already written up in detail, just not kept in the shipped code.
+
+### Investigated and reverted: touch-explore narrating a hidden-desktop app's content (WhatsApp/WebView2)
+
+Bug report: after opening WhatsApp Desktop (Microsoft Store version) on one
+virtual desktop, switching to a different, empty desktop, and touch-
+exploring/swiping there, NVDA still spoke WhatsApp's content (e.g. a
+contact/community name) - confirmed genuinely different from the
+flick-navigation bug above (this was a continuous touch-explore swipe, not
+a flick), and confirmed to still happen even with the flick-navigation fix
+in place, since `_patchedMoveTo` is a completely separate code path
+(`api.getDesktopObject().objectFromPoint(x, y)`, a fresh point-based
+hit-test every call - no navigator-object staleness involved at all).
+
+**Initial hypothesis, confirmed WRONG by live instrumentation**: guessed
+this matched a known WebView2 bug
+(`MicrosoftEdge/WebView2Feedback#5668`) where a WebView2 host window fades
+to alpha=0/`WS_EX_LAYERED` instead of actually hiding. Live
+`log.debug` dumps of the actual hit-tested hwnd during a real repro showed
+`layered=False alpha=None visible=True exStyle=0x20` - a perfectly
+ordinary, fully-opaque, non-layered window. That specific bug's mechanism
+does not apply here; don't retry it without re-confirming against a fresh
+log first.
+
+**Actual root cause, confirmed via live Win32 enumeration during a real
+repro**: WhatsApp Desktop is MSIX-packaged and hosts its UI in a WebView2
+control. The window touch-explore actually hits
+(`Chrome_RenderWidgetHostHWND`, whose top-level ancestor via
+`GetAncestor(hwnd, GA_ROOT)` is a window titled `"(99) WhatsApp"`) is owned
+by the **WebView2 helper process** (`msedgewebview2.exe`), a completely
+separate top-level window from WhatsApp's **real** application window
+(titled plain `"WhatsApp"`, owned by `WhatsApp.Root.exe`, the MSIX app's
+root process) - confirmed via `EnumWindows` + `GetWindowThreadProcessId`
+that these are two distinct, ownerless top-level windows with **no Win32
+window-level relationship** between them at all (`GetParent`/
+`GetWindow(GW_OWNER)` both return `NULL` both ways) - the only relationship
+is that `msedgewebview2.exe` is a **child process** of `WhatsApp.Root.exe`.
+
+`IVirtualDesktopManager::IsWindowOnCurrentVirtualDesktop` gives the
+**correct** answer (`False`, with a resolvable `GetWindowDesktopId`) for
+WhatsApp's real app window, but an **incorrect** answer (`True`) for its
+WebView2 helper window - confirmed reproducibly with a fresh COM manager
+instance each time (ruling out a stale/cached COM object) and via an
+atomic single-function-call snapshot comparing both windows together
+(ruling out a timing race between separate calls). `DwmGetWindowAttribute`
+`DWMWA_CLOAKED` has the identical split: `0` (not cloaked) on the WebView2
+window, `2` (`DWM_CLOAKED_SHELL`, correctly indicating "hidden by the
+shell") on the real app window - so this isn't specific to one API, both
+of Windows' own mechanisms for this get the WebView2 window wrong in the
+same way. This is corroborated by the same open, unresolved
+WebView2Feedback#5668 issue (independently confirming WhatsApp's WebView2
+window does something unusual with its window state/visibility across
+virtual desktop switches - a different manifestation of the same
+underlying "this app's helper window isn't tracked like a normal window"
+category of problem, not the specific alpha-fade mechanism guessed at
+first). Chromium's own documentation
+(`chromium/src/docs/windows_virtual_desktop_handling.md`) states plainly
+that Windows gives no notification when a window changes virtual desktops,
+and that Chromium itself only re-derives this state at safe checkpoints
+(focus events) rather than trusting it live - i.e. even Chromium's own
+engineers don't treat this OS state as reliable ground truth on every
+query, which matches what was found here.
+
+**Fix attempted**: walk the process tree from the hit window's owning
+process (via `CreateToolhelp32Snapshot`/`Process32FirstW`/`Process32NextW`)
+to find its **parent** process, then find that parent's own visible,
+ownerless top-level window via `EnumWindows`, and query
+`IsWindowOnCurrentVirtualDesktop`/`DWMWA_CLOAKED` against *that* window
+instead (treating either signal indicating "not current" as authoritative,
+combining both since neither alone was trusted after the above findings).
+This resolved the WebView2 window (`msedgewebview2.exe`) to WhatsApp's real
+window (`WhatsApp.Root.exe`'s own top-level window) correctly and gave the
+right answer (`False`) when tested standalone, outside NVDA, against the
+exact hwnd from a real repro.
+
+**Why this was reverted anyway**: after shipping this fix and asking the
+user to re-test inside NVDA, the bug still reproduced. Root-caused this
+specific regression to the diagnostic process itself, not the fix's own
+logic: repeated ad-hoc standalone script probes of
+`IVirtualDesktopManager` run minutes apart (to compare the same hwnd's
+answer at different points) gave **inconsistent, contradictory results
+across separate runs and fresh COM manager instances** - e.g. the exact
+same WhatsApp hwnd reported both matching and non-matching desktop GUIDs
+relative to the foreground window depending on which desktop happened to
+be active *at the moment each separate script was invoked*, which the
+investigator did not control for and could not observe from outside NVDA.
+This made it impossible to tell, from outside a live NVDA session, whether
+the fix's logic was actually correct in the moment the bug reproduced, or
+whether the API's behavior itself had shifted between the standalone
+verification and the in-NVDA retest. Diagnosing this properly would have
+needed the atomic, single-call, in-process instrumentation approach (like
+`describeVirtualDesktopState` in the fix's now-reverted code) captured
+during an actual live repro inside NVDA, cross-referencing the real NVDA
+log - the same discipline documented in "Debugging workflow" below - rather
+than separate ad-hoc script invocations at different, uncontrolled points
+in time. This diagnostic loop (rebuild → reinstall → restart NVDA →
+reproduce → fetch and read the log → interpret → rebuild again) is also
+inherently slow and resource-intensive per iteration, and after several
+rounds without a fully confirmed fix, continuing was judged not worth the
+cost for what is a narrow edge case (one specific MSIX/WebView2 app's
+touch-explore narration after a virtual desktop switch, not a general
+usability or safety problem) - explicitly decided with the user to stop
+and document rather than keep iterating.
+
+**Current state**: this fix was fully reverted (`ghostWindow.py` deleted;
+`virtualDesktop.py` reverted back to its simple pre-existing form used only
+by the flick-navigation fix above; `_patchedMoveTo` reverted back to plain
+`api.getDesktopObject().objectFromPoint(x, y)` with no skip/re-resolve
+logic). The bug is real, understood in detail, and documented as a known
+limitation in README.md rather than fixed. If revisiting this: the process-
+tree-walk approach and the combined `IsWindowOnCurrentVirtualDesktop` +
+`DWMWA_CLOAKED` signal were both independently confirmed correct against
+the exact real hwnd from a repro when tested standalone - the open question
+is only whether that result holds up when captured atomically *during* a
+live, in-NVDA repro rather than via separate later script runs. Re-add the
+atomic `describeVirtualDesktopState`-style diagnostic (log everything in
+one `log.debug` call per touch-explore hit, from inside `_patchedMoveTo`
+itself) and get a fresh log from a live repro before trusting any of this
+again - don't re-verify via standalone scripts run afterward, they cannot
+be trusted to reflect the state at the moment of the actual bug.
+
 ### Feature: explore/click sound effects, replacing the tone beep
 
 User-supplied `explore.mp3`/`click.mp3` (in the repo's own `resources/`

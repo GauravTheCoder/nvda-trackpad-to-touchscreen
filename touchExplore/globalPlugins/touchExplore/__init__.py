@@ -48,6 +48,7 @@ from scriptHandler import script
 from utils.security import objectBelowLockScreenAndWindowsIsLocked
 
 from . import touchpadOsSettings
+from . import virtualDesktop
 from .trackpadTouch import TrackpadTouchScreen
 
 _SOUNDS_DIR = os.path.join(os.path.dirname(__file__), "sounds")
@@ -201,11 +202,31 @@ def _navigateAndAnnounce(newObj) -> None:
 	focusable (plain static content, text, etc - not every navigable object
 	is a selectable control), _touchSelect() is a no-op, so we fall back to
 	announcing it exactly like the stock scripts do.
+
+	Virtual-desktop guard: creating/switching virtual desktops (Ctrl+Win+D)
+	doesn't destroy or move windows, only hides them, so the navigator
+	object can still be sitting inside a window that's no longer on the
+	visible desktop (e.g. WhatsApp, if it was touch-explored right before
+	switching desktops). Walking further from there via simpleNext/etc and
+	then calling _touchSelect() would move REAL OS focus/selection into
+	that hidden window - not just stale narration, an actual focus-steal
+	into an app the user can't see. Skip the real focus/selection move (and
+	fall back to plain narration, matching the "not focusable" branch
+	below) whenever newObj's window is confirmed to be on a different
+	virtual desktop than the current one. See virtualDesktop.py.
 	"""
 	if not api.setNavigatorObject(newObj):
 		import gui
 
 		ui.reviewMessage(gui.blockAction.Context.WINDOWS_LOCKED.translatedMessage)
+		return
+	onCurrentDesktop = virtualDesktop.isOnCurrentVirtualDesktop(getattr(newObj, "windowHandle", None))
+	if onCurrentDesktop is False:
+		log.debug(
+			f"touchExplore: _navigateAndAnnounce newObj={newObj!r} is on a "
+			"different virtual desktop - skipping real focus/selection move",
+		)
+		speech.speakObject(newObj, reason=controlTypes.OutputReason.FOCUS)
 		return
 	statesBefore = newObj.states
 	_touchSelect(newObj)

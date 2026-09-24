@@ -175,3 +175,34 @@ Limitations:
   its default of 10px to 25px. If taps still misdetect on your hardware, or
   if genuine small drags start being misread as taps, adjust the value in
   `touchExplore/globalPlugins/touchExplore/__init__.py`.
+- **Known limitation: touch-explore can still narrate an app's content after
+  you've switched away to a different virtual desktop, for certain apps.**
+  Confirmed with WhatsApp Desktop (the Microsoft Store version): after
+  opening it on one virtual desktop and switching to a different, empty
+  desktop, swiping/touch-exploring on that other desktop can still speak
+  WhatsApp's content. Root cause: WhatsApp Desktop is packaged as an MSIX
+  app that hosts its UI in a WebView2 control - the window touch-explore
+  actually hits belongs to a separate helper process (`msedgewebview2.exe`)
+  from WhatsApp's own real application window (`WhatsApp.Root.exe`), with no
+  Win32 parent/owner relationship between the two. Windows' own
+  `IVirtualDesktopManager` COM API (the standard way to check which virtual
+  desktop a window belongs to) gives the correct answer for WhatsApp's real
+  window but an incorrect one for its WebView2 helper window - which is the
+  window actually hit-tested here - so this add-on cannot reliably tell that
+  window apart from one that's genuinely on the current desktop. This
+  appears to be a genuine Windows/WebView2 defect, not specific to this
+  add-on: a similar WebView2 window-state bug for this same app is
+  independently reported and still open upstream
+  (`MicrosoftEdge/WebView2Feedback#5668`), and Chromium's own documentation
+  states plainly that Windows gives no notification when a window changes
+  virtual desktops, so even Chromium re-derives this state defensively
+  rather than trusting it live. A fix was attempted (walking the process
+  tree from the helper process to find WhatsApp's real window, then
+  querying that instead) and did work for one confirmed hwnd during
+  testing, but was not reliably re-verified across repeated repro attempts
+  before this line of investigation was stopped as too deep/costly relative
+  to how narrow the impact is - the real focus-stealing side effect of this
+  same bug for *flick*-based navigation (as opposed to plain touch-explore
+  narration) is separately fixed, see `virtualDesktop.py`. If you hit this,
+  the workaround is to close the affected app rather than just switching
+  virtual desktops away from it.
