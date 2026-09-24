@@ -569,6 +569,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	# --- Additional VoiceOver-inspired touch gestures ---------------------
 	# All on gesture IDs NVDA 2026.2's globalCommands leaves unbound (checked
 	# against the release-2026.2 source): 2finger_tap, 3finger_double_tap,
+	# 3finger_triple_tap,
 	# 3finger_flickup/down in object mode (text mode's 3finger_flickDown is
 	# stock say-all, untouched), 2finger_triple_tap, and 2finger_pinchin/out
 	# (pinch trackers are always numFingers=2, so the ID carries "2finger_").
@@ -599,6 +600,25 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			speech.cancelSpeech()
 			audioCues.play(audioCues.OFF)
 			speech.setSpeechMode(SpeechMode.off)
+
+	@script(
+		description=_(
+			# Translators: Input help mode message for the screen curtain touch gesture.
+			"Toggles the screen curtain (makes the screen black, or shows it again). "
+			"Once: until NVDA restarts. Twice quickly: until you turn it off",
+		),
+		gestures=("ts:3finger_triple_tap",),
+	)
+	def script_touchToggleScreenCurtain(self, gesture):
+		# Straight through to NVDA's own command (kb:NVDA+control+escape), so
+		# its availability check, warning dialog and messages all apply
+		# unchanged. Its "pressed twice = keep enabled" logic uses
+		# scriptHandler.getLastScriptRepeatCount(), which counts repeats of
+		# whichever script was executed - this one - so repeating the triple
+		# tap works the same as pressing the key twice.
+		import globalCommands
+
+		globalCommands.commands.script_toggleScreenCurtain(gesture)
 
 	def _sendKeyWithCue(self, keyName, cue, gesture):
 		from keyboardHandler import KeyboardInputGesture

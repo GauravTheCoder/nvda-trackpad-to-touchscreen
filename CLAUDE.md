@@ -1256,7 +1256,12 @@ installed). This corrects claims elsewhere in this file that came from
   `3finger_flickDown` is stock say-all), `ts:2finger_triple_tap`
   (`counterNames` = single/double/triple/quadruple), and
   `ts:2finger_pinchin/out`. Pinch trackers are always `numFingers=2`, hence
-  the `2finger_` prefix. Rate changes are stored exactly as
+  the `2finger_` prefix. `ts:3finger_triple_tap` calls
+  `globalCommands.commands.script_toggleScreenCurtain(gesture)` directly (the
+  stock NVDA+Control+Escape command, unchanged). Its "twice = permanent"
+  logic uses `getLastScriptRepeatCount()`, which counts repeats of the
+  *executed* script (the wrapper), so repeating the gesture behaves like
+  pressing the key twice. Rate changes are stored exactly as
   `synthSettingsRing` does it (`setattr(synth, ...)` plus
   `config.conf["speech"][synth.name][...]`). Keys are sent with
   `KeyboardInputGesture.fromName("pageDown"/"pageUp"/"mediaPlayPause")`,

@@ -99,6 +99,7 @@ rebuilds the packs from the original downloads.
 | Three-finger double tap | Turn speech off, or back on |
 | Three-finger flick up / down | Page Down / Page Up (like VoiceOver: flicking up shows what's further down) |
 | Two-finger triple tap | Media play/pause |
+| Three-finger triple tap | Screen curtain on/off: NVDA's own screen curtain, the same as NVDA+Control+Escape. Once: until NVDA restarts; twice quickly: until you turn it off |
 | Pinch out / in | Faster / slower speech (5 steps each) |
 
 All of these can be changed in NVDA's Input Gestures dialog, under Touch
