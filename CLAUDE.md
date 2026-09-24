@@ -1256,12 +1256,24 @@ installed). This corrects claims elsewhere in this file that came from
   `3finger_flickDown` is stock say-all), `ts:2finger_triple_tap`
   (`counterNames` = single/double/triple/quadruple), and
   `ts:2finger_pinchin/out`. Pinch trackers are always `numFingers=2`, hence
-  the `2finger_` prefix. `ts:3finger_triple_tap` calls
-  `globalCommands.commands.script_toggleScreenCurtain(gesture)` directly (the
-  stock NVDA+Control+Escape command, unchanged). Its "twice = permanent"
-  logic uses `getLastScriptRepeatCount()`, which counts repeats of the
-  *executed* script (the wrapper), so repeating the gesture behaves like
-  pressing the key twice. Rate changes are stored exactly as
+  the `2finger_` prefix. `ts:3finger_triple_tap` is **bound onto NVDA's own
+  `globalCommands.commands`** (`nvdaCommandGestures.py`:
+  `bindGesture(gesture, "toggleScreenCurtain")` at plugin start,
+  `removeGestureBinding` on terminate) rather than wrapped in a script of
+  ours. The user asked for no dependence on the command's keyboard
+  shortcut, which users can change. The link is the script *name*, which is
+  what gestures.ini stores. NVDA runs its own script natively (the real
+  once/twice repeat count). Input Gestures lists the touch gesture under
+  NVDA's own command, where users can edit it (it collects
+  `globalCommands.commands._gestureMap`), and the user gesture map still
+  wins. `bind()` never overwrites an existing NVDA binding; it probes with
+  `getScript()`, which reads only `gesture.normalizedIdentifiers`. It
+  survives a renamed script: `bindGesture` raises `LookupError`, which is
+  logged and skipped. Tested against the real 2026.2 `baseObject.py`. Use
+  the same pattern for any future "gesture for an existing NVDA command".
+  Keys sent with `KeyboardInputGesture.send()` (Page Down etc.) are safe
+  from user remapping too: `send()` runs inside `ignoreInjection()`, so
+  NVDA's own gesture maps never see them. Rate changes are stored exactly as
   `synthSettingsRing` does it (`setattr(synth, ...)` plus
   `config.conf["speech"][synth.name][...]`). Keys are sent with
   `KeyboardInputGesture.fromName("pageDown"/"pageUp"/"mediaPlayPause")`,

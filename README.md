@@ -99,11 +99,13 @@ rebuilds the packs from the original downloads.
 | Three-finger double tap | Turn speech off, or back on |
 | Three-finger flick up / down | Page Down / Page Up (like VoiceOver: flicking up shows what's further down) |
 | Two-finger triple tap | Media play/pause |
-| Three-finger triple tap | Screen curtain on/off: NVDA's own screen curtain, the same as NVDA+Control+Escape. Once: until NVDA restarts; twice quickly: until you turn it off |
+| Three-finger triple tap | Screen curtain on/off. This is an extra gesture for NVDA's own Toggle screen curtain command, so it behaves exactly like that command's keyboard shortcut (NVDA+Control+Escape unless you've changed it): once turns the curtain on until NVDA restarts, twice quickly until you turn it off |
 | Pinch out / in | Faster / slower speech (5 steps each) |
 
 All of these can be changed in NVDA's Input Gestures dialog, under Touch
-Explore Sounds. That category also lists two commands with no gesture by
+Explore Sounds - except the screen curtain gesture, which is listed under
+NVDA's own command (Vision > Toggles the state of the screen curtain), next
+to its keyboard shortcut. That category also lists two commands with no gesture by
 default:
 
 - **Touch calibration** (see below).
